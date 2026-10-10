@@ -16,6 +16,7 @@ import tempfile
 import time
 import signal
 import unittest
+import unittest.mock
 from pathlib import Path
 
 BUNDLE = Path(__file__).resolve().parent.parent
@@ -983,11 +984,13 @@ class TestPromptInjectionDefenses(Base):
         cands = L.decision_candidates(self.repo, "PI-2")
         self.assertEqual(len(cands), 1)
     def test_jira_mcp_validation_error_and_summary(self):
+        import importlib.machinery
         import importlib.util
         helm_path = BUNDLE / "payload/.helm/bin/helm"
-        spec = importlib.util.spec_from_file_location("helm_cli", str(helm_path))
+        loader = importlib.machinery.SourceFileLoader("helm_cli", str(helm_path))
+        spec = importlib.util.spec_from_loader("helm_cli", loader)
         helm_cli = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(helm_cli)
+        loader.exec_module(helm_cli)
 
         # Simulate MCP response returning Pydantic validation error text
         mock_val_err_res = {

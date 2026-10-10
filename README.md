@@ -52,22 +52,25 @@ HELM solves this by establishing a **hard boundary between agent proposal and hu
 
 ## 🚀 Quick Start
 
-### 1. Installation
+### 1. Global Setup (One-Time)
 
-Install HELM into any target repository (idempotent, safe to update):
+Install HELM globally so the `helm` command is available everywhere:
 
 ```bash
-python3 /path/to/helm/install.py /path/to/your-repo
-cd /path/to/your-repo
-git add .cursor .helm AGENTS.md .gitignore && git commit -m "chore: add HELM framework"
+python3 install.py --global
 ```
 
-*Optional CLI convenience shortcut:*
+### 2. In ANY Repository
+
+Simply navigate to any project repository and run:
+
 ```bash
-ln -s "$PWD/.helm/bin/helm" ~/.local/bin/helm
+helm start
 ```
 
-### 2. Verification Checklist
+> **Automatic Repository Initialization**: If HELM is not yet initialized in the target repository, `helm start` will automatically prompt to set up `.cursor/`, `.helm/`, and governance rules for that project on the fly.
+
+### 3. First-Time Verification Checklist
 
 1. **Protect Framework Configuration**: Add `/.cursor/ /.helm/ /AGENTS.md` to `CODEOWNERS`.
 2. **Configure Jira / Atlassian MCP** (Optional): Set credentials in `.cursor/mcp.json` or leave as placeholders for Local Story Mode (`STORY.md`).

@@ -160,15 +160,24 @@ class Base(unittest.TestCase):
 class TestInstallAndDoctor(Base):
     def test_install_is_clean_and_doctor_passes(self):
         self.assertIn("HELM:BEGIN", (self.repo / "AGENTS.md").read_text())
+        self.assertTrue((self.repo / ".cursor/mcp.json").exists())
+        mcp_cfg = json.loads((self.repo / ".cursor/mcp.json").read_text())
+        self.assertIn("atlassian", mcp_cfg.get("mcpServers", {}))
+        self.assertEqual(sh("git", "check-ignore", ".cursor/mcp.json", cwd=self.repo).returncode, 0)
+        self.assertEqual(self.guard("read", {"file_path": ".cursor/mcp.json", "cwd": str(self.repo)}).get("permission"), "deny")
         r = self.helm("doctor", check=False)
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertNotIn("[FAIL]", r.stdout)
+        self.assertIn("Atlassian MCP has placeholder/missing credentials", r.stdout)
 
     def test_install_preserves_existing_hooks_and_agents_md(self):
         (self.repo / "AGENTS.md").write_text("# Mine\nkeep me\n" + (self.repo / "AGENTS.md").read_text())
         hooks = json.loads((self.repo / ".cursor/hooks.json").read_text())
         hooks["hooks"].setdefault("stop", []).append({"command": "echo mine"})
         (self.repo / ".cursor/hooks.json").write_text(json.dumps(hooks))
+        mcp = json.loads((self.repo / ".cursor/mcp.json").read_text())
+        mcp["mcpServers"]["custom_server"] = {"command": "echo"}
+        (self.repo / ".cursor/mcp.json").write_text(json.dumps(mcp))
         sh(sys.executable, str(BUNDLE / "install.py"), str(self.repo), cwd=self.repo, env=self.env)
         txt = (self.repo / "AGENTS.md").read_text()
         self.assertIn("keep me", txt)
@@ -176,6 +185,9 @@ class TestInstallAndDoctor(Base):
         h = json.loads((self.repo / ".cursor/hooks.json").read_text())
         self.assertEqual(h["hooks"]["stop"], [{"command": "echo mine"}])
         self.assertEqual(sum("helm_guard.py" in e["command"] for e in h["hooks"]["beforeShellExecution"]), 1)
+        m = json.loads((self.repo / ".cursor/mcp.json").read_text())
+        self.assertIn("custom_server", m["mcpServers"])
+        self.assertIn("atlassian", m["mcpServers"])
 
     def test_doctor_flags_fail_open_hook(self):
         h = json.loads((self.repo / ".cursor/hooks.json").read_text())
@@ -366,6 +378,9 @@ class TestGatesAndTamper(Base):
         c, o = self.tty_run("abort", lines=["T-1"])
         self.assertEqual(c, 0, o)
         self.assertEqual(self.phase(), "IDLE")
+        # Restarting the same task ID after abort must enter DISCOVERY, not stay ABORTED
+        self.start()
+        self.assertEqual(self.phase(), "DISCOVERY")
 
 
 class TestTier1(Base):
@@ -686,32 +701,60 @@ class TestInteractiveCLI(Base):
         self.assertIn("Inspection & Status Commands", r.stdout)
         self.assertIn("Repository & Admin Commands", r.stdout)
 
+    def test_interactive_repo_init_creates_mcp_and_warns(self):
+        # Simulate global blueprint present and uninitialized repo
+        shutil.copytree(BUNDLE / "payload", self.home / "blueprint", dirs_exist_ok=True)
+        (self.repo / ".helm/policy/policy.json").unlink()
+        (self.repo / ".cursor/mcp.json").unlink()
+        code, out = self.tty_run(lines=["y"])
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.repo / ".cursor/mcp.json").exists())
+        self.assertIn("Initialized .cursor/mcp.json", out)
+        self.assertIn("Atlassian MCP in .cursor/mcp.json requires credentials (JIRA_URL, JIRA_API_TOKEN)", out)
+
     def test_interactive_start_prompts(self):
-        code, out = self.tty_run("start", lines=["INT-1", "1"])
+        # 1. Declining Local Story Mode when Atlassian MCP has placeholder credentials stops cleanly
+        code, out = self.tty_run("start", lines=["n"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("Atlassian MCP is not connected in .cursor/mcp.json (missing/placeholder: JIRA_URL, JIRA_API_TOKEN)", out)
+        self.assertIn("Continue in Local Story Mode", out)
+        self.assertIn("configure .cursor/mcp.json and re-run `helm start`", out)
+
+        # 2. Consciously accepting Local Story Mode proceeds and saves STORY.md
+        code, out = self.tty_run("start", lines=["y", "INT-1", "Implement reusable filter", "1", "8"])
         self.assertEqual(code, 0, out)
         self.assertIn("Atlassian MCP is not connected in .cursor/mcp.json", out)
-        self.assertIn("Enter local Task ID or feature name", out)
-        self.assertIn("Tier 1 — Fast-Track", out)
-        self.assertIn("task INT-1 started (tier 1)", out)
+        self.assertIn("Local Story Mode active (Atlassian MCP not connected).", out)
+        self.assertIn("Enter Task / Jira ID", out)
+        self.assertIn("Tier 1 — Quick / Small", out)
+        self.assertIn("Task INT-1 registered", out)
+        self.assertEqual((self.repo / ".helm/work/INT-1/STORY.md").read_text().strip(), "Implement reusable filter")
         st = self.status()
         self.assertEqual(st.get("active"), "INT-1")
         self.assertEqual(st.get("tier"), 1)
         self.tty_run("abort", lines=["INT-1"])
 
-        # Interactive dirty tree fallback prompt (allow)
-        (self.repo / "src/app.ts").write_text("export const a = 99;\n")
-        code, out = self.tty_run("start", lines=["INT-2", "1", "y"])
+        # 3. Missing .cursor/mcp.json is auto-initialized during helm start pre-flight
+        (self.repo / ".cursor/mcp.json").unlink()
+        code, out = self.tty_run("start", lines=["y", "INT-MCP", "", "1", "8"])
         self.assertEqual(code, 0, out)
-        self.assertIn("Notice: Uncommitted changes detected in working tree.", out)
+        self.assertTrue((self.repo / ".cursor/mcp.json").exists())
+        self.assertIn("Initialized .cursor/mcp.json", out)
+        self.tty_run("abort", lines=["INT-MCP"])
+
+        # 4. Interactive dirty tree fallback prompt (allow)
+        (self.repo / "src/app.ts").write_text("export const a = 99;\n")
+        code, out = self.tty_run("start", lines=["y", "y", "INT-2", "", "1", "8"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Uncommitted changes detected in working tree.", out)
         self.assertIn("Allow starting with uncommitted changes?", out)
-        self.assertIn("task INT-2 started (tier 1)", out)
+        self.assertIn("Task INT-2 registered", out)
         self.tty_run("abort", lines=["INT-2"])
 
-        # Interactive dirty tree fallback prompt (decline)
-        code, out = self.tty_run("start", lines=["INT-3", "1", "n"])
+        # 5. Interactive dirty tree fallback prompt (decline)
+        code, out = self.tty_run("start", lines=["n"])
         self.assertNotEqual(code, 0)
-        self.assertIn("task start cancelled.", out)
-        self.assertIn("Commit or stash your changes", out)
+        self.assertIn("working tree is not clean", out)
 
     def test_interactive_approve_auto_detects_phase(self):
         wd = self.start("APPR-AUTO-1", tier=1)

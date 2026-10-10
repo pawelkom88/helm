@@ -21,8 +21,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / "payload"
 BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
-GITIGNORE = [".helm/work/", ".helm/bootstrap/", "__pycache__/"]
-MERGED = {".cursor/hooks.json", ".cursor/cli.json"}
+GITIGNORE = [".helm/work/", ".helm/bootstrap/", ".cursor/mcp.json", "__pycache__/"]
+MERGED = {".cursor/hooks.json", ".cursor/cli.json", ".cursor/mcp.json"}
 KEEP_IF_EXISTS = {".helm/skills.lock.json"}
 
 
@@ -44,11 +44,23 @@ def merge_hooks(dst: Path, src: Path):
 
 def merge_cli(dst: Path, src: Path):
     ours = json.loads(src.read_text())
-    cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "permissions": {"allow": [], "deny": []}}
+    cur = json.loads(dst.read_text()) if dst.exists() else {"permissions": {"allow": [], "deny": []}}
+    cur.pop("version", None)
     perms = cur.setdefault("permissions", {})
     for k in ("allow", "deny"):
         lst = perms.setdefault(k, [])
         lst += [x for x in ours["permissions"].get(k, []) if x not in lst]
+    dst.write_text(json.dumps(cur, indent=2) + "\n")
+
+
+def merge_mcp(dst: Path, src: Path):
+    ours = json.loads(src.read_text())
+    cur = json.loads(dst.read_text()) if dst.exists() else {"mcpServers": {}}
+    servers = cur.setdefault("mcpServers", {})
+    for k, v in ours.get("mcpServers", {}).items():
+        if k not in servers:
+            servers[k] = v
+    dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(cur, indent=2) + "\n")
 
 
@@ -149,6 +161,9 @@ def main():
         elif rel == ".cursor/cli.json":
             merge_cli(dst, src)
             say("merged .cursor/cli.json (your own permissions preserved)")
+        elif rel == ".cursor/mcp.json":
+            merge_mcp(dst, src)
+            say("initialized .cursor/mcp.json (set JIRA_URL, JIRA_USERNAME & JIRA_API_TOKEN for Jira integration)")
         elif rel in KEEP_IF_EXISTS and dst.exists():
             continue
         elif rel == ".helm/policy/policy.json" and dst.exists() and dst.read_bytes() != src.read_bytes() and not a.reset_policy:
@@ -182,8 +197,8 @@ def main():
           "       git add .cursor .helm AGENTS.md .gitignore && git commit -m 'chore: add HELM framework'\n"
           "  2. Add to CODEOWNERS (so framework changes need review):\n"
           "       /.cursor/   @your-platform-team\n       /.helm/     @your-platform-team\n       /AGENTS.md  @your-platform-team\n"
-          "  3. Configure the Atlassian MCP server (see docs/atlassian-mcp.example.json) and make sure its key matches\n"
-          "     mcp.allow_servers in .helm/policy/policy.json.\n"
+          "  3. Configure the Atlassian MCP server in .cursor/mcp.json (set JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN)\n"
+          "     or leave as placeholders to use Local Story Mode (STORY.md).\n"
           "  4. Put helm on your PATH:  ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm\n"
           "  5. helm doctor --live        # proves hooks really fire through your Cursor CLI (do not skip)\n"
           "  6. helm bootstrap start      # then /bootstrap in Cursor: builds the repo-specific layer")

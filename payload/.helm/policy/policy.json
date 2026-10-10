@@ -46,7 +46,8 @@
     "~/.config/gh/**",
     "~/.docker/config.json",
     "~/.git-credentials",
-    "~/.cursor/mcp.json"
+    "~/.cursor/mcp.json",
+    "**/.cursor/mcp.json"
   ],
   "secret_allow_globs": [
     "**/.env.example",
@@ -95,7 +96,7 @@
     "allow_servers": [
       "atlassian"
     ],
-    "allow_tool_regex": "^(get|search|lookup|list|fetch)[A-Za-z0-9_]*$|^atlassianUserInfo$",
+    "allow_tool_regex": "^((jira|confluence)_)?(get|search|lookup|list|fetch)[A-Za-z0-9_]*$|^atlassianUserInfo$",
     "confluence_regex": "(?i)confluence",
     "confluence_max_calls": 6,
     "max_calls_per_task": 60

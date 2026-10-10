@@ -468,7 +468,7 @@ def append_record(root, task, rec: dict) -> dict:
     return rec
 
 
-def load_records(root, task):
+def load_records(root, task, all_runs: bool = False):
     p = task_dir(root, task) / "records.jsonl"
     out = []
     if not p.exists():
@@ -480,6 +480,11 @@ def load_records(root, task):
             continue
         if verify_sig(r):
             out.append(r)
+    if not all_runs:
+        for idx in range(len(out) - 1, -1, -1):
+            if out[idx].get("gate") == "task" and out[idx].get("decision") == "start":
+                out = out[idx:]
+                break
     return out
 
 
@@ -721,6 +726,10 @@ def derive(root, pol, active) -> dict:
     base = trec["baseline"]["head"]
     out["base"] = base
     decs = load_records(root, task)
+    for idx in range(len(decs) - 1, -1, -1):
+        if decs[idx].get("gate") == "task" and decs[idx].get("decision") == "start":
+            decs = decs[idx + 1:]
+            break
     cfg = tier_cfg(pol, tier)
 
     if _count(decs, "task", "abort"):

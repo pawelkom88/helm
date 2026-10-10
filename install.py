@@ -21,7 +21,19 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / "payload"
 BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
-GITIGNORE = [".helm/work/", ".helm/bootstrap/", ".cursor/mcp.json", "__pycache__/"]
+GITIGNORE = [
+    ".helm/",
+    ".cursor/agents/",
+    ".cursor/commands/",
+    ".cursor/skills/",
+    ".cursor/cli.json",
+    ".cursor/hooks.json",
+    ".cursor/mcp.json",
+    "AGENTS.md",
+    "mcp_jira_config.json",
+    "__pycache__/",
+    "*.py[cod]",
+]
 MERGED = {".cursor/hooks.json", ".cursor/cli.json", ".cursor/mcp.json"}
 KEEP_IF_EXISTS = {".helm/skills.lock.json"}
 

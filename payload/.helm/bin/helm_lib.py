@@ -552,6 +552,26 @@ def section(body: str, heading: str) -> str:
     return (rest[:n.start()] if n else rest).strip()
 
 
+HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
+INVISIBLE_UNICODE_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff\U000e0000-\U000e007f]")
+ARTIFACT_INJECTION_RE = re.compile(
+    r"(?i)ignore (all |any )?(previous|prior) instructions|"
+    r"</?(system|system_instruction|user_message|assistant)\b|"
+    r"<!--\s*HELM:(BEGIN|END)"
+)
+
+
+def template_comments(root: Path, filename: str) -> set[str]:
+    """Return the exact stock HTML comments present in .helm/templates/<filename>."""
+    for cand in (Path(root) / ".helm/templates" / filename, Path(__file__).resolve().parent.parent / "templates" / filename):
+        if cand.is_file():
+            try:
+                return {m.strip() for m in HTML_COMMENT_RE.findall(cand.read_text(encoding="utf-8", errors="replace"))}
+            except OSError:
+                pass
+    return set()
+
+
 def validate(wd: Path, name: str, tier: int = 2, root=None):
     spec = SPECS[name]
     root = Path(root) if root else Path(wd).resolve().parents[2]
@@ -572,6 +592,14 @@ def validate(wd: Path, name: str, tier: int = 2, root=None):
     if meta.get("status") == "ready":
         if "{{" in body:
             probs.append("unfilled template placeholder `{{...}}` remains")
+        allowed_comments = template_comments(root, spec["file"])
+        extra_comments = [m.strip() for m in HTML_COMMENT_RE.findall(body) if m.strip() not in allowed_comments]
+        if extra_comments:
+            probs.append("unexpected HTML comment `<!-- ... -->` in ready artifact (hidden prompt-injection risk)")
+        if INVISIBLE_UNICODE_RE.search(body):
+            probs.append("invisible/bidirectional Unicode control characters detected in artifact (obfuscation risk)")
+        if ARTIFACT_INJECTION_RE.search(body):
+            probs.append("prompt-injection override phrase or fake instruction boundary tag detected in artifact")
         if name == "WORK" and not section(body, "Acceptance Criteria"):
             probs.append("Acceptance Criteria is empty")
         if name == "REVIEW":
@@ -647,13 +675,16 @@ def decision_candidates(root, task):
     wd = root / WORK_REL / task
     out = []
     if (wd / "WORK.md").exists():
-        for l in section(read_meta(wd / "WORK.md")[1], "Decisions").splitlines():
-            l = l.strip()
-            if l[:1] in "-*" and "[human]" in l:
+        raw_sec = HTML_COMMENT_RE.sub("", section(read_meta(wd / "WORK.md")[1], "Decisions"))
+        for l in raw_sec.splitlines():
+            l = re.sub(r"  +", " ", INVISIBLE_UNICODE_RE.sub("", l)).strip()
+            if l[:1] in "-*" and "[human]" in l and not ARTIFACT_INJECTION_RE.search(l):
                 out.append(re.sub(r"^[-*]\s*", "", l))
     for r in load_records(root, task):
         if r.get("gate") == "block" and r.get("decision") == "resolve" and r.get("note"):
-            out.append(f"[human] {r['note']}")
+            note = re.sub(r"  +", " ", INVISIBLE_UNICODE_RE.sub("", HTML_COMMENT_RE.sub("", str(r["note"])))).strip()
+            if note and not ARTIFACT_INJECTION_RE.search(note):
+                out.append(f"[human] {note}")
     return list(dict.fromkeys(out))
 
 
@@ -671,7 +702,8 @@ def promote_decisions(root, pol, task, items):
         f.write(existing.rstrip("\n") + "\n")
         for it in items:
             n += 1
-            text = re.sub(r"\s*\[human\]\s*", " ", it).strip()
+            clean_it = INVISIBLE_UNICODE_RE.sub("", HTML_COMMENT_RE.sub("", it)).replace("\n", " ")
+            text = re.sub(r"\s*\[human\]\s*", " ", clean_it).strip()
             f.write(f"- **DEC-{n:03d}** ({time.strftime('%Y-%m-%d')}, {task}): {text}\n")
     return rel
 

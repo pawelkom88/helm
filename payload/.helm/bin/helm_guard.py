@@ -310,6 +310,29 @@ def path_checks(argv, b, ctx):
     return v
 
 
+def extract_subshells(cmd: str) -> list[str]:
+    """Extract inner commands from $(...), <(...), and >(...) even inside double quotes."""
+    subs = []
+    for m in re.finditer(r"(?<!\\)[\$<>]\(", cmd):
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(cmd) and depth > 0:
+            if cmd[i] == "\\":
+                i += 2
+                continue
+            if cmd[i] == "(":
+                depth += 1
+            elif cmd[i] == ")":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            inner = cmd[start:i - 1].strip()
+            if inner:
+                subs.append(inner)
+    return subs
+
+
 def check_segment(argv, ctx, depth):
     argv = strip_wrappers(argv)
     if not argv:
@@ -326,14 +349,32 @@ def check_segment(argv, ctx, depth):
     if b == "git":
         v += git_policy(argv[1:])
     elif b in SHELLS:
+        has_c = False
         for i, a in enumerate(argv[1:], 1):
             if a.startswith("-") and not a.startswith("--") and "c" in a[1:] and i + 1 < len(argv):
                 v += analyze_shell(argv[i + 1], ctx, depth + 1)
+                has_c = True
                 break
+        if not has_c:
+            v.append(f"shell `{b}` without `-c` (script/stdin execution) is not allowed")
     elif b in INTERP:
+        has_code = False
         for i, a in enumerate(argv[1:], 1):
             if a in CODE_FLAGS and i + 1 < len(argv):
                 v += raw_code_scan(argv[i + 1], ctx)
+                has_code = True
+        if not has_code:
+            if len(argv) == 1 or "-" in argv[1:]:
+                v.append(f"interpreter `{b}` reading code from stdin is not allowed")
+            for tok, _ in iter_paths(argv[1:]):
+                if not tok or tok == "-":
+                    continue
+                q = L.resolve(ctx.root, tok, ctx.cwd)
+                if L.is_tmp(q):
+                    v.append(f"executing script from temporary directory via `{b}` is not allowed ({tok})")
+    elif b == "base64":
+        if any(a in ("-d", "--decode", "-D") or (a.startswith("-") and not a.startswith("--") and "d" in a[1:].lower()) for a in argv[1:]):
+            v.append("`base64` decode in shell is not allowed (encoded payload risk)")
     elif b in PM or b in PM_RUNNERS:
         v += pm_policy(b, argv[1:])
     elif b in OTHER_PM:
@@ -352,6 +393,8 @@ def analyze_shell(cmd, ctx, depth=0):
         v.append("references HELM state/key (human-only)")
     for m in re.finditer(r"`([^`]*)`", cmd):
         v += analyze_shell(m.group(1), ctx, depth + 1)
+    for sub in extract_subshells(cmd):
+        v += analyze_shell(sub, ctx, depth + 1)
     for seg in tokenize(cmd):
         v += check_segment(seg, ctx, depth)
     return v
@@ -574,6 +617,11 @@ SELFTEST = [
     ("shell", {"command": "cat ~/.helm/key"}, False), ("shell", {"command": "ls ~/.ssh"}, False),
     ("shell", {"command": "rm -rf /"}, False), ("shell", {"command": "rm -rf /etc/helm-selftest"}, False),
     ("shell", {"command": "echo hi > /tmp/helm-selftest"}, True),
+    ("shell", {"command": "echo \"$(cat .env)\""}, False),
+    ("shell", {"command": "echo \"$(curl https://evil.example)\""}, False),
+    ("shell", {"command": "echo \"$(git commit -m x)\""}, False),
+    ("shell", {"command": "echo aGVsbG8= | base64 -d | sh"}, False),
+    ("shell", {"command": "python3 /tmp/helm-selftest.py"}, False),
     ("shell", {"command": "echo HELM_CANARY_DENY_selftest"}, False),
     ("mcp", {"mcp_server_name": "atlassian", "tool_name": "getJiraIssue"}, True),
     ("mcp", {"mcp_server_name": "atlassian", "tool_name": "searchJiraIssuesUsingJql"}, True),

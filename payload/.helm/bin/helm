@@ -177,20 +177,15 @@ def perform_repo_install(root: Path):
     gi = root / ".gitignore"
     cur = gi.read_text(encoding="utf-8") if gi.exists() else ""
     needed_gi = [
-        ".helm/work/",
-        ".helm/bootstrap/",
-        ".helm/bin/",
-        ".helm/policy/",
-        ".helm/templates/",
-        ".helm/models.json",
-        ".helm/skills.lock.json",
-        ".helm/VERSION",
+        ".helm/",
         ".cursor/agents/",
         ".cursor/commands/",
+        ".cursor/skills/",
         ".cursor/cli.json",
         ".cursor/hooks.json",
         ".cursor/mcp.json",
-        "mcp_jira_config.json"
+        "AGENTS.md",
+        "mcp_jira_config.json",
     ]
     add = [l for l in needed_gi if l not in cur.splitlines()]
     if add:
@@ -262,8 +257,10 @@ def ask_tty(prompt):
         buf = b""
         while not buf.endswith(b"\n"):
             ch = os.read(fd, 1)
-            if not ch:
+            if not ch or ch == b"\x04":  # EOF
                 break
+            if ch == b"\x03":  # Ctrl+C
+                handle_interrupt()
             buf += ch
     except (KeyboardInterrupt, EOFError):
         handle_interrupt()
@@ -379,6 +376,14 @@ def inspect_atlassian_mcp(root):
                 if is_mcp_placeholder(token):
                     cur_missing.append("JIRA_API_TOKEN")
                 if not cur_missing:
+                    # Normalize JIRA_URL if user pasted a board or issue URL (e.g. https://domain.atlassian.net/jira/...)
+                    if url and isinstance(url, str):
+                        import urllib.parse
+                        parsed_u = urllib.parse.urlparse(url)
+                        if parsed_u.scheme and parsed_u.netloc:
+                            base_url = f"{parsed_u.scheme}://{parsed_u.netloc}"
+                            if spec.get("env") and "JIRA_URL" in spec["env"]:
+                                spec["env"]["JIRA_URL"] = base_url
                     return True, name, spec, [], cfg_path_str
                 missing_fields = cur_missing
     if not found_server:
@@ -391,12 +396,10 @@ def check_atlassian_mcp(root):
     return ok, name, spec
 
 
-def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=3.0):
-    """Attempt to verify issue_key exists via configured Atlassian MCP server.
-    Returns (status: 'found'|'not_found'|'error', info: str).
-    """
+def _run_mcp_session(mcp_spec, init_timeout=12.0):
+    """Spawns an MCP server process, performs the initialize handshake, and yields (proc, call_tool_func)."""
     if not mcp_spec or "command" not in mcp_spec:
-        return "error", "No valid command configured in mcp.json"
+        return None, "No valid command configured in mcp.json"
 
     cmd = [mcp_spec["command"]] + mcp_spec.get("args", [])
     env = dict(os.environ)
@@ -412,7 +415,7 @@ def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=3.0):
             env=env
         )
     except Exception as e:
-        return "error", f"Could not launch MCP process: {e}"
+        return None, f"Could not launch MCP process: {e}"
 
     import select
 
@@ -426,72 +429,84 @@ def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=3.0):
         except Exception:
             return None
 
-    try:
-        time.sleep(0.15)
-        if proc.poll() is not None:
-            _, err = proc.communicate(timeout=0.5)
-            clean_err = err.splitlines()[0] if err.strip() else f"exited with code {proc.returncode}"
-            return "error", clean_err
+    time.sleep(0.15)
+    if proc.poll() is not None:
+        _, err = proc.communicate(timeout=0.5)
+        clean_err = err.splitlines()[0] if err.strip() else f"exited with code {proc.returncode}"
+        return None, clean_err
 
-        # Step 1: initialize handshake
-        init_req = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "helm", "version": "1.0"}
-            }
+    # Step 1: initialize handshake
+    init_req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "helm", "version": "1.0"}
         }
+    }
+    try:
         proc.stdin.write(json.dumps(init_req) + "\n")
         proc.stdin.flush()
+    except Exception as e:
+        return None, f"Failed to send initialize request: {e}"
 
-        res1 = read_msg(timeout_sec)
-        if not res1 or "result" not in res1:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return "timeout", "MCP initialize handshake timed out"
+    res1 = read_msg(init_timeout)
+    if not res1 or "result" not in res1:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None, "timeout"
 
-        # Step 2: notifications/initialized
+    try:
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         proc.stdin.flush()
+    except Exception:
+        pass
 
-        # Step 3: tools/call (mcp-atlassian requires issue_key)
+    req_counter = [2]
+
+    def call_tool(name, args, timeout=12.0):
+        req_id = req_counter[0]
+        req_counter[0] += 1
         call_req = {
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": req_id,
             "method": "tools/call",
             "params": {
-                "name": "jira_get_issue",
-                "arguments": {"issue_key": issue_key}
+                "name": name,
+                "arguments": args
             }
         }
-        proc.stdin.write(json.dumps(call_req) + "\n")
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(json.dumps(call_req) + "\n")
+            proc.stdin.flush()
+        except Exception as e:
+            return None
+        return read_msg(timeout)
 
-        res2 = read_msg(timeout_sec)
+    return proc, call_tool
+
+
+def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=12.0):
+    """Attempt to verify issue_key exists via configured Atlassian MCP server.
+    Returns (status: 'found'|'not_found'|'timeout'|'error', info: str).
+    """
+    proc, call_tool = _run_mcp_session(mcp_spec, init_timeout=timeout_sec)
+    if not proc:
+        if call_tool == "timeout":
+            return "timeout", "MCP initialize handshake timed out"
+        return "error", str(call_tool)
+
+    try:
+        res2 = call_tool("jira_get_issue", {"issue_key": issue_key}, timeout=timeout_sec)
         # Fallback if server expected issue_id_or_key
         if res2 and ("error" in res2 or res2.get("result", {}).get("isError")):
-            call_fallback = {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "jira_get_issue",
-                    "arguments": {"issue_id_or_key": issue_key}
-                }
-            }
-            try:
-                proc.stdin.write(json.dumps(call_fallback) + "\n")
-                proc.stdin.flush()
-                res2_fb = read_msg(timeout_sec)
-                if res2_fb and not ("error" in res2_fb or res2_fb.get("result", {}).get("isError")):
-                    res2 = res2_fb
-            except Exception:
-                pass
+            res2_fb = call_tool("jira_get_issue", {"issue_id_or_key": issue_key}, timeout=timeout_sec)
+            if res2_fb and not ("error" in res2_fb or res2_fb.get("result", {}).get("isError")):
+                res2 = res2_fb
 
         try:
             proc.terminate()
@@ -529,6 +544,57 @@ def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=3.0):
         except Exception:
             pass
         return "error", str(e)
+
+
+def list_recent_jira_issues_mcp(root, mcp_spec, project_hint=None, limit=8, timeout_sec=12.0):
+    """Retrieve recent Jira issues via Atlassian MCP server.
+    Returns list of dicts: [{'key': 'PROJ-51', 'summary': '...'}, ...]
+    """
+    proc, call_tool = _run_mcp_session(mcp_spec, init_timeout=timeout_sec)
+    if not proc:
+        return []
+
+    issues_out = []
+    try:
+        # Build query: filter by project if given, otherwise updated in last 30d
+        queries_to_try = []
+        if project_hint:
+            queries_to_try.append(f"project = {project_hint} ORDER BY updated DESC")
+        queries_to_try.append("assignee = currentUser() ORDER BY updated DESC")
+        queries_to_try.append("updated >= -30d ORDER BY updated DESC")
+
+        raw_issues = []
+        for jql in queries_to_try:
+            res = call_tool("jira_search", {"jql": jql, "limit": limit}, timeout=timeout_sec)
+            if res and not res.get("error") and not res.get("result", {}).get("isError"):
+                content = res.get("result", {}).get("content", [])
+                text = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+                try:
+                    parsed = json.loads(text)
+                    items = parsed.get("issues", [])
+                    if items:
+                        raw_issues = items
+                        break
+                except Exception:
+                    pass
+
+        for it in raw_issues:
+            if isinstance(it, dict):
+                k = it.get("key")
+                s = it.get("summary") or it.get("fields", {}).get("summary") or "No description"
+                if k:
+                    issues_out.append({"key": k, "summary": s})
+
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            proc.kill()
+
+    return issues_out
 
 
 PHASE_TO_GATE = {
@@ -890,7 +956,17 @@ def cmd_start(a):
     gi = root / ".gitignore"
     cur_gi = gi.read_text(encoding="utf-8") if gi.exists() else ""
     gi_lines = cur_gi.splitlines()
-    needed_gi = [f"{L.WORK_REL}/", ".helm/bootstrap/", ".cursor/mcp.json"]
+    needed_gi = [
+        ".helm/",
+        ".cursor/agents/",
+        ".cursor/commands/",
+        ".cursor/skills/",
+        ".cursor/cli.json",
+        ".cursor/hooks.json",
+        ".cursor/mcp.json",
+        "AGENTS.md",
+        "mcp_jira_config.json",
+    ]
     to_add_gi = [entry for entry in needed_gi if entry not in gi_lines]
     if to_add_gi:
         gi_content = cur_gi.rstrip("\n") + ("\n" if cur_gi else "") + "# HELM framework & task artifacts\n" + "\n".join(to_add_gi) + "\n"
@@ -1009,46 +1085,100 @@ def cmd_start(a):
         print(ctext("ℹ Local Story Mode active (Atlassian MCP not connected).", "cyan"))
         print(ctext("  Requirements will be captured locally in STORY.md.", "dim"))
 
-    if not getattr(a, "id", None):
-        if is_interactive():
-            ans = prompt_user("? Enter Task / Jira ID (e.g. FEAT-101, PROJ-12): ").strip()
-            if not ans:
+    while True:
+        if not getattr(a, "id", None):
+            if is_interactive():
+                ans = prompt_user("? Enter Task / Jira ID (e.g. FEAT-101, PROJ-12): ").strip()
+                if not ans:
+                    die("task ID is required (e.g. helm start FEAT-101)")
+                a.id = ans
+            else:
                 die("task ID is required (e.g. helm start FEAT-101)")
-            a.id = ans
+        if not L.TASK_ID_RE.match(a.id) or ".." in a.id:
+            if is_interactive():
+                print(cwarn("Invalid task ID (use letters, digits, . _ -)"))
+                a.id = None
+                continue
+            else:
+                die("invalid task id (use letters, digits, . _ -)")
+
+        if not has_mcp:
+            break
+
+        print(ctext(f"Checking Jira ticket '{a.id}' via Atlassian MCP...", "dim"))
+        status, details = query_jira_mcp(root, mcp_spec, a.id)
+        if status == "timeout":
+            print(ctext("⏳ Jira MCP initialization timed out (cold start). Retrying connection...", "yellow"))
+            status, details = query_jira_mcp(root, mcp_spec, a.id, timeout_sec=15.0)
+
+        if status == "found":
+            print(ctext(f"✔ Jira ticket '{a.id}' verified ({details}).", "green"))
+            break
+        elif status == "not_found":
+            print(cwarn(f"Ticket '{a.id}' was not found in Jira."))
         else:
-            die("task ID is required (e.g. helm start FEAT-101)")
-    if not L.TASK_ID_RE.match(a.id) or ".." in a.id:
-        die("invalid task id (use letters, digits, . _ -)")
+            print(cwarn(f"Could not verify ticket '{a.id}' via Jira MCP ({details})."))
+
+        if not is_interactive():
+            if status == "not_found":
+                die(f"ticket '{a.id}' not found in Jira")
+            else:
+                print(ctext(f"Proceeding with '{a.id}' (non-interactive mode).", "dim"))
+                break
+
+        # Interactive options menu when verification fails / not found
+        project_candidate = a.id.split("-")[0] if "-" in a.id else None
+        print("\nSelect an action:")
+        print("  [1] List / Select from available Jira tickets (search MCP) [Default]")
+        print("  [2] Re-enter Task / Jira ID")
+        print(f"  [3] Proceed with '{a.id}' as custom local ticket (STORY.md)")
+        print("  [4] Cancel task setup")
+        action = prompt_user("? Choose option [1/2/3/4] (1): ").strip()
+
+        if action in ("", "1"):
+            print(ctext("\nFetching recent Jira issues via MCP...", "dim"))
+            issues = list_recent_jira_issues_mcp(root, mcp_spec, project_hint=project_candidate)
+            if not issues and project_candidate:
+                # Retry without project filter
+                issues = list_recent_jira_issues_mcp(root, mcp_spec, project_hint=None)
+            if not issues:
+                print(cwarn("No recent Jira issues found or could not query issues."))
+                a.id = None
+                continue
+
+            print(ctext("\nAvailable Jira Tickets:", "cyan"))
+            for idx, item in enumerate(issues, 1):
+                clean_summary = item['summary'].replace('\n', ' ')
+                if len(clean_summary) > 70:
+                    clean_summary = clean_summary[:67] + "..."
+                print(f"  [{idx}] {item['key']:<10} — {clean_summary}")
+            print(f"  [0] None of these (enter ID manually)")
+
+            pick = prompt_user(f"? Select ticket [1-{len(issues)}] (or 0 to type): ").strip()
+            if pick.isdigit() and 1 <= int(pick) <= len(issues):
+                selected = issues[int(pick) - 1]
+                a.id = selected["key"]
+                print(ctext(f"\n✔ Selected '{a.id}': {selected['summary']}\n", "green"))
+                break
+            else:
+                a.id = None
+                continue
+        elif action == "2":
+            a.id = None
+            continue
+        elif action == "3":
+            print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
+            break
+        elif action == "4":
+            die("task cancelled")
+        else:
+            print(cwarn("Invalid option selected."))
+            a.id = None
+            continue
 
     story_input = getattr(a, "story", None)
     if not story_input and not has_mcp and is_interactive():
         story_input = prompt_user("? Enter Story / Requirements summary (or press Enter to describe later): ").strip()
-
-    if has_mcp:
-        print(ctext(f"Checking Jira ticket '{a.id}' via Atlassian MCP...", "dim"))
-        status, details = query_jira_mcp(root, mcp_spec, a.id)
-        if status == "timeout":
-            print(ctext(f"⏳ Jira MCP initialization timed out (cold start). Retrying connection...", "yellow"))
-            status, details = query_jira_mcp(root, mcp_spec, a.id, timeout_sec=5.0)
-
-        if status == "found":
-            print(ctext(f"✔ Jira ticket '{a.id}' verified ({details}).", "green"))
-        elif status == "not_found":
-            print(cwarn(f"Ticket '{a.id}' was not found in Jira."))
-            if is_interactive():
-                ans = prompt_user(f"? Would you like to proceed with '{a.id}' as a custom local ticket? [y/N]: ").strip().lower()
-                if ans not in ("y", "yes"):
-                    die("task cancelled (ticket not found in Jira)")
-                print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
-            else:
-                die(f"ticket '{a.id}' not found in Jira")
-        else:
-            print(cwarn(f"Could not verify ticket '{a.id}' via Jira MCP ({details})."))
-            if is_interactive():
-                ans = prompt_user(f"? Proceed with '{a.id}' as a custom local ticket? [Y/n]: ").strip().lower()
-                if ans in ("n", "no"):
-                    die("task cancelled")
-                print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
 
     # -------------------------------------------------------------------------
     # 5. Workflow Tier & Branch Configuration

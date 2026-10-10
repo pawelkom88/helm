@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import signal
 import unittest
 from pathlib import Path
 
@@ -757,10 +759,94 @@ class TestInteractiveCLI(Base):
         self.assertIn("working tree is not clean", out)
 
     def test_keyboard_interrupt_exits_cleanly(self):
-        code, out = self.tty_run("start", lines=["\x03"])
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            os.execvpe(sys.executable, [sys.executable, str(self.repo / ".helm/bin/helm"), "start"], self.env)
+        time.sleep(0.4)
+        os.kill(pid, signal.SIGINT)
+        out = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                out += chunk
+            except OSError:
+                break
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        out_str = out.decode(errors="replace")
         self.assertEqual(code, 130)
-        self.assertIn("Cancelled by user", out)
-        self.assertNotIn("Traceback", out)
+        self.assertIn("Cancelled by user", out_str)
+        self.assertNotIn("Traceback", out_str)
+
+    def test_interactive_jira_mcp_ticket_selection(self):
+        # Configure a mock MCP server that returns fake Jira tickets outside git repo
+        mock_py = self.tmp / "mock_mcp.py"
+        mock_py.write_text("""import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name")
+        args = req.get("params", {}).get("arguments", {})
+        if name == "jira_get_issue":
+            key = args.get("issue_key") or args.get("issue_id_or_key")
+            if key == "FOUND-10":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"key": "FOUND-10", "summary": "Fix login crash"})}]}})
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "Issue does not exist"}], "isError": True}})
+        elif name == "jira_search":
+            issues = [
+                {"key": "FOUND-10", "summary": "Fix login crash"},
+                {"key": "PROJ-51", "summary": "Implement Bulk Status Update"}
+            ]
+            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"issues": issues})}]}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {"message": "unknown tool"}})
+""")
+        mcp_cfg = {
+            "mcpServers": {
+                "atlassian": {
+                    "command": sys.executable,
+                    "args": [str(mock_py)],
+                    "env": {
+                        "JIRA_URL": "https://test.atlassian.net",
+                        "JIRA_USERNAME": "test@test.com",
+                        "JIRA_API_TOKEN": "valid_token_123"
+                    }
+                }
+            }
+        }
+        (self.repo / ".cursor/mcp.json").write_text(json.dumps(mcp_cfg, indent=2))
+        self.tty_run("integrity", "refresh", lines=["refresh"])
+
+        # Test selecting option 1 (list tickets) and picking option 2 (PROJ-51)
+        # Inputs:
+        # 1. Ticket ID typed: "TYPO-99" (fails)
+        # 2. Action: "1" (List tickets)
+        # 3. Selection: "2" (Pick PROJ-51)
+        # 4. Tier: "1"
+        # 5. Branch: "8" (skip)
+        code, out = self.tty_run("start", lines=["TYPO-99", "1", "2", "1", "8"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Ticket 'TYPO-99' was not found in Jira", out)
+        self.assertIn("Available Jira Tickets:", out)
+        self.assertIn("PROJ-51", out)
+        self.assertIn("Selected 'PROJ-51': Implement Bulk Status Update", out)
+        self.assertIn("Task PROJ-51 registered", out)
+        self.tty_run("abort", lines=["PROJ-51"])
 
     def test_interactive_approve_auto_detects_phase(self):
         wd = self.start("APPR-AUTO-1", tier=1)

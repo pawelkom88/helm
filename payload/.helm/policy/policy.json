@@ -1,0 +1,167 @@
+{
+  "version": 1,
+  "protected_paths": [
+    ".cursor/**",
+    ".helm/bin/**",
+    ".helm/policy/**",
+    ".helm/templates/**",
+    ".helm/repo/**",
+    ".helm/skills.lock.json",
+    ".helm/VERSION",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODEOWNERS",
+    ".github/CODEOWNERS",
+    ".github/workflows/**",
+    ".gitlab-ci.yml",
+    "bitbucket-pipelines.yml",
+    "azure-pipelines.yml",
+    "Jenkinsfile",
+    ".circleci/**",
+    ".husky/**",
+    ".gitattributes",
+    "docs/decisions.md"
+  ],
+  "secret_globs": [
+    "**/.env",
+    "**/.env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.kdbx",
+    "**/id_rsa*",
+    "**/id_ed25519*",
+    "**/.npmrc",
+    "**/.netrc",
+    "**/.pypirc",
+    "**/credentials",
+    "**/credentials.json",
+    "**/*.secret",
+    "~/.ssh/**",
+    "~/.aws/**",
+    "~/.azure/**",
+    "~/.kube/**",
+    "~/.config/gcloud/**",
+    "~/.config/gh/**",
+    "~/.docker/config.json",
+    "~/.git-credentials",
+    "~/.cursor/mcp.json"
+  ],
+  "secret_allow_globs": [
+    "**/.env.example",
+    "**/.env.sample",
+    "**/.env.template",
+    "**/.env.defaults"
+  ],
+  "test_globs": [
+    "**/*.test.*",
+    "**/*.spec.*",
+    "**/__tests__/**",
+    "**/__mocks__/**",
+    "**/test/**",
+    "**/tests/**"
+  ],
+  "shell": {
+    "deny_commands": [
+      "sudo",
+      "su",
+      "doas",
+      "curl",
+      "wget",
+      "nc",
+      "ncat",
+      "netcat",
+      "telnet",
+      "ssh",
+      "scp",
+      "sftp",
+      "ftp",
+      "rsync",
+      "gh",
+      "glab",
+      "hub",
+      "eval",
+      "crontab",
+      "at",
+      "kubectl",
+      "terraform",
+      "aws",
+      "gcloud",
+      "az"
+    ]
+  },
+  "mcp": {
+    "allow_servers": [
+      "atlassian"
+    ],
+    "allow_tool_regex": "^(get|search|lookup|list|fetch)[A-Za-z0-9_]*$|^atlassianUserInfo$",
+    "confluence_regex": "(?i)confluence",
+    "confluence_max_calls": 6,
+    "max_calls_per_task": 60
+  },
+  "web": {
+    "allow_search": false,
+    "fetch_domains": [
+      "react.dev",
+      "tanstack.com",
+      "developer.mozilla.org",
+      "www.typescriptlang.org",
+      "vitest.dev",
+      "testing-library.com",
+      "storybook.js.org",
+      "nodejs.org"
+    ]
+  },
+  "subagents": {
+    "mode": "audit",
+    "allow": [
+      "bootstrapper",
+      "discovery",
+      "planner",
+      "test-analyst",
+      "implementer",
+      "reviewer",
+      "specialist-reviewer",
+      "explore"
+    ]
+  },
+  "require_task_for_source_writes": false,
+  "unknown_payload": "deny",
+  "tiers": {
+    "1": {
+      "plan_stage": false,
+      "test_analysis": false,
+      "review_required": false
+    },
+    "2": {
+      "plan_stage": true,
+      "test_analysis": true,
+      "review_required": true
+    }
+  },
+  "staleness_watch": [
+    "package.json",
+    "**/package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "bun.lockb",
+    "pnpm-workspace.yaml",
+    "turbo.json",
+    "nx.json",
+    "lerna.json",
+    "tsconfig*.json",
+    "**/tsconfig*.json",
+    "vite.config.*",
+    "vitest.config.*",
+    "jest.config.*",
+    ".storybook/**",
+    ".eslintrc*",
+    "eslint.config.*",
+    ".github/workflows/**",
+    "Dockerfile",
+    "bitbucket-pipelines.yml"
+  ],
+  "decisions_log": "docs/decisions.md"
+}

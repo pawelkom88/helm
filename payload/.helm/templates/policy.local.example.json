@@ -1,0 +1,8 @@
+{
+  "mcp":   { "allow_servers": ["atlassian"] },
+  "test_globs": ["**/*.cy.ts", "e2e/**"],
+  "protected_paths": ["infra/**", "deploy/**"],
+  "secret_globs": ["**/config/production.*"],
+  "staleness_watch": ["apps/*/vite.config.*"],
+  "web": { "fetch_domains": ["ui.company.example"] }
+}

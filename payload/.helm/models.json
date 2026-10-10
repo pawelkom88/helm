@@ -1,0 +1,39 @@
+{
+  "models": [
+    {
+      "id": "inherit",
+      "name": "inherit (uses active chat model)",
+      "reasoning": false
+    },
+    {
+      "id": "claude-3-7-sonnet",
+      "name": "Anthropic Claude 3.7 Sonnet",
+      "reasoning": false
+    },
+    {
+      "id": "claude-3-5-sonnet",
+      "name": "Anthropic Claude 3.5 Sonnet",
+      "reasoning": false
+    },
+    {
+      "id": "gpt-4o",
+      "name": "OpenAI GPT-4o",
+      "reasoning": false
+    },
+    {
+      "id": "o3-mini",
+      "name": "OpenAI o3-mini (Reasoning)",
+      "reasoning": true
+    },
+    {
+      "id": "o1",
+      "name": "OpenAI o1 (High Reasoning)",
+      "reasoning": true
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "name": "Google Gemini 2.5 Pro",
+      "reasoning": false
+    }
+  ]
+}

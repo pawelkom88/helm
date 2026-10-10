@@ -1,0 +1,8 @@
+{
+  "_comment": "Project-level .cursor/mcp.json. The server KEY must equal an entry in policy mcp.allow_servers (default: \"atlassian\"). Confirm the current endpoint in Atlassian's Rovo MCP documentation. Use an OAuth app / service account with READ-ONLY scopes; HELM additionally denies every non-read tool, but least privilege on the Atlassian side is the real control.",
+  "mcpServers": {
+    "atlassian": {
+      "url": "https://mcp.atlassian.com/v1/mcp"
+    }
+  }
+}

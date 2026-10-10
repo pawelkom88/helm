@@ -1,0 +1,2212 @@
+#!/usr/bin/env python3
+"""helm — Human-Controlled AI Engineering Framework CLI.
+
+HUMAN-ONLY (denied to the agent by the guard, and TTY-gated):
+  start, work, continue, review, approve, reject, unblock, abort, finish, baseline, integrity, bootstrap, skills add,
+  violations --ack, doctor --live
+AGENT-SAFE:
+  status, check, verify, metrics, log, doctor, skills verify|list
+CI (no key, no state): ci
+"""
+from __future__ import annotations
+
+import sys
+sys.dont_write_bytecode = True  # never leave untracked .pyc in the workspace
+import argparse
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import helm_guard as G  # noqa: E402
+import helm_lib as L  # noqa: E402
+
+GATE_PHASE = {"discovery": "AWAITING_DISCOVERY_APPROVAL", "plan": "AWAITING_PLAN_APPROVAL", "final": "AWAITING_FINAL_APPROVAL"}
+PRE_IMPL = {"DISCOVERY", "AWAITING_DISCOVERY_APPROVAL", "PLANNING", "AWAITING_PLAN_APPROVAL"}
+NEXT = {
+    "DISCOVERY": ("agent", "Run `helm work` (or in Cursor `/work`): the discovery role produces {wd}/WORK.md."),
+    "AWAITING_DISCOVERY_APPROVAL": ("human", "Review {wd}/WORK.md, then:  helm approve discovery   (or: helm reject discovery -m '...')"),
+    "PLANNING": ("agent", "Run `helm continue` (or in Cursor `/continue`): the planner produces {wd}/PLAN.md."),
+    "AWAITING_PLAN_APPROVAL": ("human", "Review {wd}/PLAN.md, then:  helm approve plan   (or: helm reject plan -m '...')"),
+    "TEST_ANALYSIS": ("agent", "Run `helm continue` (or in Cursor `/continue`): the test analyst produces {wd}/TEST-PLAN.md."),
+    "IMPLEMENTATION": ("agent", "Run `helm continue` (or in Cursor `/continue`): the implementer changes code and writes {wd}/IMPL.md."),
+    "VERIFICATION": ("agent", "Run `helm verify` on current diff; or `helm continue` to have the implementer fix failures."),
+    "REVIEW": ("agent", "Run `helm review` (or in Cursor `/review`): the independent reviewer writes {wd}/REVIEW.md."),
+    "AWAITING_FINAL_APPROVAL": ("human", "Review the diff + {wd}/REVIEW.md, then:  helm approve final   (or: helm reject final -m '...')"),
+    "READY_FOR_DEVELOPER": ("human", "Git is yours: review `git diff`, commit yourself. Then:  helm finish"),
+    "BLOCKED": ("human", "Read {wd}/BLOCKED.md and decide:  helm unblock -m 'Decision: ...'"),
+    "POLICY_BLOCK": ("human", "A guardrail was bypassed or hit. Inspect:  helm violations   then:  helm violations --ack -m '...'"),
+    "STATE_TAMPERED": ("human", "Task state failed its signature check. Run:  helm doctor"),
+    "ABORTED": ("none", "Task aborted."),
+    "FINISHED": ("none", "Task finished."),
+}
+
+
+# --------------------------------------------------------------------------- helpers
+def die(msg, code=1):
+    print(f"helm: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_blueprint():
+    cands = [
+        Path.home() / ".helm/blueprint",
+        Path(__file__).resolve().parent.parent.parent / "payload",
+        Path(__file__).resolve().parent.parent,
+    ]
+    for c in cands:
+        if (c / ".helm/policy/policy.json").exists() or (c / "policy/policy.json").exists():
+            return c
+    return None
+
+
+def merge_hooks(dst: Path, src: Path):
+    ours = json.loads(src.read_text())
+    cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "hooks": {}}
+    cur.setdefault("version", 1)
+    hooks = cur.setdefault("hooks", {})
+    for ev, entries in ours["hooks"].items():
+        kept = [e for e in hooks.get(ev, []) if "helm_guard.py" not in e.get("command", "")]
+        hooks[ev] = kept + entries
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n")
+
+
+def merge_cli(dst: Path, src: Path):
+    ours = json.loads(src.read_text())
+    cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "permissions": {"allow": [], "deny": []}}
+    perms = cur.setdefault("permissions", {})
+    for k in ("allow", "deny"):
+        lst = perms.setdefault(k, [])
+        lst += [x for x in ours["permissions"].get(k, []) if x not in lst]
+    dst.write_text(json.dumps(cur, indent=2) + "\n")
+
+
+def insert_block(agents: Path, block: str):
+    BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
+    block = block.strip() + "\n"
+    if agents.exists():
+        txt = agents.read_text(encoding="utf-8")
+        if BEGIN in txt and END in txt:
+            a, b = txt.index(BEGIN), txt.index(END) + len(END)
+            txt = txt[:a] + block.rstrip("\n") + txt[b:]
+        else:
+            txt = txt.rstrip("\n") + "\n\n" + block
+    else:
+        txt = block
+    agents.write_text(txt, encoding="utf-8")
+
+
+def perform_repo_install(root: Path):
+    bp = find_blueprint()
+    if not bp:
+        die("cannot locate HELM blueprint payload (check ~/.helm/blueprint)")
+    payload_dir = bp if (bp / ".helm").exists() else (bp.parent if (bp.parent / ".helm").exists() else bp)
+
+    print(ctext(f"\nInitializing HELM into {root.name}...", "bold"))
+    for src in sorted(p for p in payload_dir.rglob("*") if p.is_file()):
+        rel = src.relative_to(payload_dir).as_posix()
+        if rel == "AGENTS.helm.md" or rel.startswith(".cursor/skills/") or "__pycache__" in rel or rel.endswith(".pyc"):
+            continue
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if rel == ".cursor/hooks.json":
+            merge_hooks(dst, src)
+        elif rel == ".cursor/cli.json":
+            merge_cli(dst, src)
+        elif rel == ".helm/policy/policy.json" and dst.exists():
+            continue
+        else:
+            shutil.copy2(src, dst)
+    for f in ("helm", "helm_guard.py", "helm_lib.py"):
+        p = root / ".helm/bin" / f
+        if p.exists():
+            os.chmod(p, 0o755)
+    print(ctext("  ✔ Installed agents, commands, templates, and security guard hooks", "green"))
+
+    agents_src = payload_dir / "AGENTS.helm.md"
+    if not agents_src.exists():
+        agents_src = bp / "AGENTS.helm.md"
+    if agents_src.exists():
+        insert_block(root / "AGENTS.md", agents_src.read_text(encoding="utf-8"))
+        print(ctext("  ✔ Configured AI governance constitution (AGENTS.md)", "green"))
+
+    gi = root / ".gitignore"
+    cur = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    add = [l for l in [".helm/work/", ".helm/bootstrap/"] if l not in cur.splitlines()]
+    if add:
+        gi.write_text(cur.rstrip("\n") + ("\n" if cur else "") + "# HELM task artifacts\n" + "\n".join(add) + "\n", encoding="utf-8")
+        print(ctext("  ✔ Configured .gitignore (.helm/work/ and .helm/bootstrap/)", "green"))
+
+    pol = L.load_policy(root)
+    L.ensure_key()
+    L.state_dir(root).mkdir(parents=True, exist_ok=True)
+    L.integrity_refresh(root, pol)
+    print(ctext("  ✔ Initialized HMAC signing key and integrity manifest", "green"))
+    return pol
+
+
+def ctx():
+    root = L.find_root()
+    try:
+        pol = L.load_policy(root)
+    except L.PolicyError as e:
+        if is_interactive():
+            border = "─" * 68
+            print(ctext(f"\n┌{border}┐", "cyan"))
+            header_line = f"  HELM {L.FRAMEWORK_VERSION} — Human-Controlled AI Engineering"
+            print(ctext(f"│{header_line:<68}│", "bold"))
+            print(ctext(f"├{border}┤", "cyan"))
+            msg1 = "  HELM is not yet initialized in this repository."
+            print(f"│{msg1:<68}│")
+            rel_name = f"  Repository  : {root.name}"
+            print(f"│{rel_name:<68}│")
+            print(ctext(f"└{border}┘", "cyan"))
+            ans = prompt_user("\n? Would you like to initialize HELM now? [Y/n]: ").strip().lower()
+            if ans in ("", "y", "yes"):
+                pol = perform_repo_install(root)
+                print(ctext("\n✔ Setup complete!\n", "green"))
+            else:
+                die(f"{e}")
+        else:
+            die(f"{e} (run `helm` interactively to initialize)")
+    return root, pol
+
+
+def _open_tty():
+    try:
+        return os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        die("this action needs an interactive human terminal (no TTY available) — run it yourself, not through an agent")
+
+
+def require_tty():
+    os.close(_open_tty())
+
+
+def ask_tty(prompt):
+    """Prompt on the controlling terminal (not stdin/stdout, which an agent could redirect)."""
+    fd = _open_tty()
+    try:
+        os.write(fd, prompt.encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            ch = os.read(fd, 1)
+            if not ch:
+                break
+            buf += ch
+    finally:
+        os.close(fd)
+    return buf.decode(errors="replace").strip()
+
+
+def confirm(prompt, expected):
+    return ask_tty(prompt) == expected
+
+
+def _has_tty():
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+        os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def is_interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def use_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None and os.environ.get("TERM") != "dumb"
+
+
+def ctext(text, style):
+    if not use_color():
+        return str(text)
+    codes = {
+        "bold": "\033[1m", "dim": "\033[2m", "cyan": "\033[36m",
+        "green": "\033[32m", "yellow": "\033[33m", "blue": "\033[34m",
+        "magenta": "\033[35m", "red": "\033[31m",
+        "orange": "\033[38;5;208m", "bold_orange": "\033[1;38;5;208m",
+        "reset": "\033[0m"
+    }
+    return f"{codes.get(style, '')}{text}{codes['reset']}"
+
+
+def cwarn(msg):
+    return ctext(f"⚠ warning: {msg}", "bold_orange")
+
+
+def prompt_user(prompt_str):
+    if is_interactive() and _has_tty():
+        return ask_tty(prompt_str)
+    if is_interactive():
+        sys.stdout.write(prompt_str)
+        sys.stdout.flush()
+        return sys.stdin.readline().strip()
+    return ""
+
+
+BRANCH_CATEGORIES = [
+    ("feat", "New feature or capability"),
+    ("bugfix", "Bug fix or regression patch"),
+    ("chore", "Maintenance, tooling, dependencies"),
+    ("refactor", "Code restructuring without behavior changes"),
+    ("test", "Test additions or improvements"),
+    ("docs", "Documentation updates"),
+    ("hotfix", "Urgent production fix"),
+    ("skip", "Stay on current branch"),
+]
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    return text.strip("-")
+
+
+def make_branch_name(category: str, ticket_id: str, desc_slug: str) -> str:
+    """Option B: <category>/<ticket>-<slug> (or <category>/<ticket> if slug is empty)."""
+    if desc_slug:
+        return f"{category}/{ticket_id}-{desc_slug}"
+    return f"{category}/{ticket_id}"
+
+
+def check_atlassian_mcp(root):
+    for f in (root / ".cursor/mcp.json", Path.home() / ".cursor/mcp.json"):
+        cfg = L.load_json(f, {}) or {}
+        servers = cfg.get("mcpServers", {})
+        for name, spec in servers.items():
+            if "atlassian" in name.lower() or "jira" in name.lower():
+                return True, name, spec
+    return False, None, None
+
+
+def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=3.0):
+    """Attempt to verify issue_key exists via configured Atlassian MCP server.
+    Returns (status: 'found'|'not_found'|'error', info: str).
+    """
+    if not mcp_spec or "command" not in mcp_spec:
+        return "error", "No valid command configured in mcp.json"
+
+    cmd = [mcp_spec["command"]] + mcp_spec.get("args", [])
+    env = dict(os.environ)
+    env.update(mcp_spec.get("env", {}))
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env
+        )
+    except Exception as e:
+        return "error", f"Could not launch MCP process: {e}"
+
+    import select
+
+    def read_msg(timeout):
+        try:
+            r, _, _ = select.select([proc.stdout], [], [], timeout)
+            if not r:
+                return None
+            line = proc.stdout.readline()
+            return json.loads(line.strip()) if line else None
+        except Exception:
+            return None
+
+    try:
+        time.sleep(0.15)
+        if proc.poll() is not None:
+            _, err = proc.communicate(timeout=0.5)
+            clean_err = err.splitlines()[0] if err.strip() else f"exited with code {proc.returncode}"
+            return "error", clean_err
+
+        # Step 1: initialize handshake
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "helm", "version": "1.0"}
+            }
+        }
+        proc.stdin.write(json.dumps(init_req) + "\n")
+        proc.stdin.flush()
+
+        res1 = read_msg(timeout_sec)
+        if not res1 or "result" not in res1:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return "error", "MCP initialize handshake timed out"
+
+        # Step 2: notifications/initialized
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.flush()
+
+        # Step 3: tools/call
+        call_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "jira_get_issue",
+                "arguments": {"issue_id_or_key": issue_key}
+            }
+        }
+        proc.stdin.write(json.dumps(call_req) + "\n")
+        proc.stdin.flush()
+
+        res2 = read_msg(timeout_sec)
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            proc.kill()
+
+        if not res2:
+            return "error", "MCP tool query timed out"
+
+        if "error" in res2:
+            err_msg = str(res2["error"])
+            if any(w in err_msg.lower() for w in ("not found", "does not exist", "404")):
+                return "not_found", err_msg
+            return "error", err_msg
+
+        content = res2.get("result", {}).get("content", [])
+        text = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        if any(w in text.lower() for w in ("not found", "issue does not exist", "cannot be found")):
+            return "not_found", text[:100]
+        return "found", text[:100] or "Ticket verified"
+
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "error", str(e)
+
+
+PHASE_TO_GATE = {
+    "AWAITING_DISCOVERY_APPROVAL": "discovery",
+    "AWAITING_PLAN_APPROVAL": "plan",
+    "AWAITING_FINAL_APPROVAL": "final",
+}
+
+
+def identity(root):
+    email = L.git_out(root, ["config", "user.email"])
+    return {"os_user": os.environ.get("USER") or os.environ.get("USERNAME") or "?", "git_email": email}
+
+
+def need_task(root):
+    active, tampered = L.load_active(root)
+    if tampered:
+        die("active-task state failed signature check (STATE_TAMPERED). Run `helm doctor`.")
+    if not active or active.get("kind") != "task":
+        die("no active task. Start one with: helm start <ID> [--tier 1|2]")
+    return active
+
+
+def overlay_info(root, pol):
+    meta = L.load_json(root / L.OVERLAY_REL / "META.json")
+    if not meta:
+        return {"present": False}
+    changed = [f for f in L.git_out(root, ["diff", "--name-only", meta.get("commit", "HEAD"), "HEAD"]).splitlines()
+               if L.any_match(pol.get("staleness_watch", []), f)]
+    return {"present": True, "commit": meta.get("commit", "")[:8], "stale_files": changed}
+
+
+def section_paths(text):
+    found = set(re.findall(r"`([^`\s]+)`", text))
+    found |= set(re.findall(r"^[-*]\s+([^\s`]+/[^\s`]*|[^\s`]+\.[A-Za-z0-9]+)\s*$", text, re.M))
+    return {f.rstrip("/") for f in found}
+
+
+def is_planned(f, planned):
+    return any(f == p or f.startswith(p + "/") for p in planned)
+
+
+def build_status(root, pol):
+    active, tampered = L.load_active(root)
+    st = {"version": L.FRAMEWORK_VERSION, "tampered": tampered, "active": None, "overlay": overlay_info(root, pol)}
+    if tampered:
+        st["phase"], st["next"] = "STATE_TAMPERED", NEXT["STATE_TAMPERED"]
+        return st
+    if not active:
+        st["phase"] = "IDLE"
+        st["next"] = ("human", "Start a task:  helm start <ID> [--tier 1|2]   or bootstrap the repo:  helm bootstrap start")
+        return st
+    if active.get("kind") == "bootstrap":
+        st["phase"], st["next"] = "BOOTSTRAP", ("agent", "Run /bootstrap in Cursor. When the proposal is ready:  helm bootstrap accept")
+        return st
+    info = L.derive(root, pol, active)
+    st.update(info)
+    st["active"] = active["task"]
+    st["writable"] = L.write_scope(root, pol, info)
+    wd = info["work_dir"]
+    st["next"] = (NEXT[info["phase"]][0], NEXT[info["phase"]][1].format(wd=wd))
+    trec = L.load_task(root, active["task"])
+    if trec:
+        st["integrity"] = L.integrity_check(root, pol)
+        st["git_changed"] = L.git_violations(trec["baseline"]["git"], L.git_snapshot(root))
+        decs = L.load_records(root, active["task"])
+        gates = {}
+        for g in ("discovery", "plan", "final"):
+            if g == "plan" and not L.tier_cfg(pol, info["tier"])["plan_stage"]:
+                continue
+            try:
+                inp = L.final_inputs(root / wd, info["diff_sha"]) if g == "final" else L.gate_inputs(root / wd, g)
+            except Exception:
+                inp = None
+            d = L.latest(decs, g, inp) if inp and (g != "final" or info.get("diff_sha")) else None
+            gates[g] = d["decision"] if d else "pending"
+        st["gates"] = gates
+    return st
+
+
+def print_status(st, brief=False):
+    if brief:
+        w = st.get("writable")
+        ws = ""
+        if w:
+            ws = " writes=" + (",".join(Path(x).name for x in w["files"]) + ("+source" if w["source"] else ""))
+        print(f"HELM {st.get('active') or '-'} phase={st['phase']}{ws} next={st['next'][0]}")
+        return
+
+    task_id = st.get("active") or "-"
+    tier_val = st.get("tier")
+    tier_str = "Tier 1: Fast-Track" if tier_val == 1 else ("Tier 2: Deep Governance" if tier_val == 2 else f"Tier {tier_val or '-'}")
+
+    # Header card
+    header_title = f" HELM {st['version']} ── Task: {task_id} ({tier_str}) "
+    pad_len = max(4, 70 - len(header_title))
+    print(ctext("\n┌─" + header_title + "─" * pad_len, "cyan"))
+
+    # Phase
+    phase_colors = {
+        "DISCOVERY": "cyan", "PLANNING": "cyan", "TEST_ANALYSIS": "cyan", "IMPLEMENTATION": "blue",
+        "VERIFICATION": "blue", "REVIEW": "blue",
+        "AWAITING_DISCOVERY_APPROVAL": "bold_orange", "AWAITING_PLAN_APPROVAL": "bold_orange",
+        "AWAITING_FINAL_APPROVAL": "bold_orange", "READY_FOR_DEVELOPER": "green",
+        "BLOCKED": "red", "POLICY_BLOCK": "red", "STATE_TAMPERED": "red",
+        "FINISHED": "green", "ABORTED": "dim", "IDLE": "dim"
+    }
+    p_color = phase_colors.get(st["phase"], "bold")
+    print(f"│  Phase          : " + ctext(st["phase"], p_color))
+
+    # Gates
+    if st.get("gates"):
+        mark = {"approve": ctext("✔", "green"), "reject": ctext("✘", "red"), "pending": ctext("·", "dim")}
+        gates_str = "   ".join(f"{g} {mark.get(v, v)}" for g, v in st["gates"].items())
+        print(f"│  Gates          : {gates_str}")
+
+    # Writable files
+    if st.get("writable"):
+        w = st["writable"]
+        write_targets = ", ".join(w["files"] + w["globs"]) + (" + repository source" if w["source"] else "") or "nothing"
+        print(f"│  Agent Writable : {write_targets}")
+
+    # Integrity
+    if st.get("integrity"):
+        print(f"│  Integrity      : " + ctext("DRIFT → " + "; ".join(st["integrity"][:4]), "red"))
+    elif "integrity" in st:
+        print(f"│  Integrity      : " + ctext("ok", "green"))
+
+    # Repo Knowledge is only relevant when idle (no active task)
+    if not st.get("active"):
+        ov = st.get("overlay", {})
+        if not ov.get("present"):
+            print(f"│  Repo Knowledge : " + ctext("not indexed (optional: `helm bootstrap start`)", "dim"))
+        else:
+            status_txt = f"fresh ({ov['commit']})" if not ov.get("stale_files") else f"stale ({len(ov['stale_files'])} watched files changed)"
+            print(f"│  Repo Knowledge : {status_txt}")
+
+    # Divider
+    print(ctext("├" + "─" * 70, "cyan"))
+
+    # Next step (high contrast callout)
+    who, text = st["next"]
+    if who == "agent":
+        print(ctext("│  👉 NEXT STEP (AI Agent Turn):", "bold"))
+        print("│     " + ctext(text, "cyan"))
+    elif who == "human":
+        print(ctext("│  👉 NEXT STEP (Human Decision Required):", "bold_orange"))
+        gate = next((g for g, p in GATE_PHASE.items() if p == st.get("phase")), None)
+        if gate:
+            wd_str = st.get("work_dir", ".helm/work/<id>")
+            review_target = f"{wd_str}/WORK.md" if gate == "discovery" else (f"{wd_str}/PLAN.md" if gate == "plan" else f"the diff + {wd_str}/REVIEW.md")
+            print("│     " + ctext(f"Review {review_target}, then decide:", "dim"))
+            print("│     " + ctext(f"• To approve : helm approve {gate}", "green"))
+            print("│     " + ctext(f"• To reject  : helm reject {gate} -m \"your feedback\"", "bold_orange"))
+        else:
+            print("│     " + ctext(text, "green"))
+    else:
+        print(f"│  Status         : {text}")
+
+    print(ctext("└" + "─" * 70 + "\n", "cyan"))
+
+
+def show_welcome_card():
+    prog = "helm"
+    title_name = "HELM"
+    full_name = "Human-Controlled AI Engineering"
+
+    root = None
+    st = None
+    try:
+        root = L.find_root()
+        pol = L.load_policy(root)
+        st = build_status(root, pol)
+    except L.PolicyError:
+        if root and is_interactive():
+            border = "─" * 68
+            print(ctext(f"┌{border}┐", "cyan"))
+            header_line = f"  {title_name} {L.FRAMEWORK_VERSION} — {full_name}"
+            print(ctext(f"│{header_line:<68}│", "bold"))
+            print(ctext(f"├{border}┤", "cyan"))
+            msg1 = "  HELM is not yet initialized in this repository."
+            print(f"│{msg1:<68}│")
+            rel_name = f"  Repository  : {root.name}"
+            print(f"│{rel_name:<68}│")
+            print(ctext(f"└{border}┘", "cyan"))
+
+            ans = prompt_user("\n? Would you like to initialize HELM in this repository now? [Y/n]: ").strip().lower()
+            if ans in ("", "y", "yes"):
+                perform_repo_install(root)
+                print(ctext(f"\n┌{border}┐", "green"))
+                print(ctext("│  ✔ Setup complete!                                                 │", "bold"))
+                print("│                                                                    │")
+                print("│  To begin your first task, run:                                    │")
+                print(f"│    {ctext(f'{prog} start', 'cyan'):<77}│")
+                print(ctext(f"└{border}┘", "green"))
+                return
+            else:
+                print("Initialization skipped.")
+                return
+    except Exception:
+        pass
+
+    border = "─" * 68
+    print(ctext(f"┌{border}┐", "cyan"))
+    header_line = f"  {title_name} {L.FRAMEWORK_VERSION} — {full_name}"
+    print(ctext(f"│{header_line:<68}│", "bold"))
+    print(ctext(f"├{border}┤", "cyan"))
+
+    if st:
+        active = st.get("active")
+        phase = st.get("phase", "IDLE")
+        tier = st.get("tier", "-")
+        if active:
+            status_line = f"  Task        : {active} (Phase: {phase}, Tier: {tier})"
+        else:
+            status_line = f"  Task        : IDLE (no active task)"
+        print(f"│{status_line:<68}│")
+
+        who, nxt = st.get("next", ("none", "None"))
+        next_line = f"  Next Action : [{who.capitalize()}] {nxt}"
+        if len(next_line) > 66:
+            next_line = next_line[:63] + "..."
+        print(f"│{next_line:<68}│")
+    else:
+        status_line = "  Task        : Not inside an initialized repository root"
+        print(f"│{status_line:<68}│")
+        tip_line = f"  Run `{prog} init` or `python3 install.py <repo>` to get started"
+        print(f"│{tip_line:<68}│")
+
+    print(ctext(f"├{border}┤", "cyan"))
+    print(ctext("│  HUMAN WORKFLOW:                                                   │", "bold"))
+    print(f"│    {prog} start [ID]        Start task (interactive ID & tier selection)│")
+    print(f"│    {prog} work [story]       Dispatch discovery / story execution       │")
+    print(f"│    {prog} continue           Dispatch current active role in workflow   │")
+    print(f"│    {prog} review             Dispatch independent reviewer role         │")
+    print(f"│    {prog} approve [gate]     Approve pending gate (auto-detects phase)  │")
+    print(f"│    {prog} reject [gate]      Reject gate with feedback to agent         │")
+    print(f"│    {prog} unblock            Provide human decision for BLOCKED agent   │")
+    print(f"│    {prog} finish             Complete task and promote human decisions  │")
+    print(f"│    {prog} abort              Cancel active task and discard state       │")
+    print(ctext("│  INSPECTION & REPO:                                                │", "bold"))
+    print(f"│    {prog} status             Inspect workflow phase and write scope     │")
+    print(f"│    {prog} check [artifact]   Validate artifact schemas and constraints  │")
+    print(f"│    {prog} verify             Run verification check suite on git diff   │")
+    print(f"│    {prog} doctor             Audit environment health and Cursor hooks  │")
+    print(f"│    {prog} setup              Configure specialized agent models         │")
+    print(ctext(f"├{border}┤", "cyan"))
+    tip = f"Tip: Run '{prog} --help' or '{prog} <command> --help' for details."
+    print(f"│  {tip:<66}│")
+    print(ctext(f"└{border}┘", "cyan"))
+
+
+def load_models(root):
+    cands = [root / ".helm/models.json", root / "payload/.helm/models.json", Path(__file__).resolve().parent.parent / "models.json"]
+    for c in cands:
+        if c.exists():
+            data = L.load_json(c)
+            if data and isinstance(data.get("models"), list):
+                return data["models"], c
+    defaults = [
+        {"id": "inherit", "name": "inherit (uses active chat model)", "reasoning": False},
+        {"id": "claude-3-7-sonnet", "name": "Anthropic Claude 3.7 Sonnet", "reasoning": False},
+        {"id": "claude-3-5-sonnet", "name": "Anthropic Claude 3.5 Sonnet", "reasoning": False},
+        {"id": "gpt-4o", "name": "OpenAI GPT-4o", "reasoning": False},
+        {"id": "o3-mini", "name": "OpenAI o3-mini (Reasoning)", "reasoning": True},
+        {"id": "o1", "name": "OpenAI o1 (High Reasoning)", "reasoning": True},
+        {"id": "gemini-2.5-pro", "name": "Google Gemini 2.5 Pro", "reasoning": False}
+    ]
+    return defaults, root / ".helm/models.json"
+
+
+def update_agent_model(file_path: Path, model_id: str, reasoning_effort: str = None):
+    text = file_path.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return False
+    frontmatter = parts[1]
+    lines = frontmatter.splitlines()
+    new_lines = []
+    has_model = False
+    has_effort = False
+    for line in lines:
+        if line.strip().startswith("model:"):
+            new_lines.append(f"model: {model_id}")
+            has_model = True
+        elif line.strip().startswith("reasoning_effort:"):
+            if reasoning_effort:
+                new_lines.append(f"reasoning_effort: {reasoning_effort}")
+                has_effort = True
+        else:
+            new_lines.append(line)
+    if not has_model:
+        new_lines.append(f"model: {model_id}")
+    if reasoning_effort and not has_effort:
+        new_lines.append(f"reasoning_effort: {reasoning_effort}")
+    new_frontmatter = "\n".join(new_lines) + "\n"
+    file_path.write_text(f"---{new_frontmatter}---{parts[2]}", encoding="utf-8")
+    return True
+
+
+def decision_md(root, task):
+    wd = root / L.WORK_REL / task
+    rows = [r for r in L.load_records(root, task)]
+    lines = [f"# Decision record — {task}", "", "_Generated by `helm`; the authoritative signed records live outside the workspace._", "",
+             "| time | gate | decision | by | binds | note |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        binds = ", ".join(f"{k}:{str(v)[:8]}" for k, v in (r.get("inputs") or {}).items())
+        who = (r.get("user") or {}).get("git_email") or (r.get("user") or {}).get("os_user") or "-"
+        lines.append(f"| {r['ts']} | {r['gate']} | {r['decision']} | {who} | {binds} | {str(r.get('note', '')).replace('|', '/')[:80]} |")
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / "DECISION.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines)
+
+
+def feedback(root, task, text):
+    wd = root / L.WORK_REL / task
+    wd.mkdir(parents=True, exist_ok=True)
+    with open(wd / "FEEDBACK.md", "a", encoding="utf-8") as f:
+        f.write(f"\n## {L.now()} (human)\n{text}\n")
+
+
+def preflight(root, pol, active, info, strict_tree):
+    trec = L.load_task(root, active["task"])
+    if not trec:
+        die("task record failed signature check")
+    drift = L.integrity_check(root, pol)
+    if drift:
+        die("framework/protected files changed since the last human refresh:\n  " + "\n  ".join(drift) +
+            "\nInspect with `git diff`; if you made the change run `helm integrity refresh`.")
+    gv = L.git_violations(trec["baseline"]["git"], L.git_snapshot(root))
+    if gv:
+        die("Git state changed since task start (" + ", ".join(gv) + "). Agents must not touch Git. Inspect, then `helm baseline refresh` if the change is yours.")
+    if strict_tree and L.diff_sha(root, trec["baseline"]["head"]) != trec["baseline"]["diff"]:
+        die("the working tree changed before implementation was authorised. Inspect `git status`/`git diff`; revert or `helm baseline refresh`.")
+    return trec
+
+
+# --------------------------------------------------------------------------- commands
+def cmd_init(a):
+    root, pol = ctx()
+    L.ensure_key()
+    L.state_dir(root).mkdir(parents=True, exist_ok=True)
+    L.integrity_refresh(root, pol)
+    print(f"initialised: key at {L.key_path()}, state at {L.state_dir(root)}")
+    print("Add to PATH for convenience:  ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm")
+
+
+def cmd_start(a):
+    root, pol = ctx()
+
+    # -------------------------------------------------------------------------
+    # 1. Pre-flight Auto-Initialization (Keys, State dir, Gitignore, Manifest)
+    # -------------------------------------------------------------------------
+    if not L.key_path().exists():
+        L.ensure_key()
+        print(ctext("  ✔ Initialized HMAC signing key", "green"))
+    L.state_dir(root).mkdir(parents=True, exist_ok=True)
+
+    gi = root / ".gitignore"
+    cur_gi = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    gi_lines = cur_gi.splitlines()
+    needed_gi = [f"{L.WORK_REL}/", ".helm/bootstrap/"]
+    to_add_gi = [entry for entry in needed_gi if entry not in gi_lines]
+    if to_add_gi:
+        gi_content = cur_gi.rstrip("\n") + ("\n" if cur_gi else "") + "# HELM task artifacts\n" + "\n".join(to_add_gi) + "\n"
+        gi.write_text(gi_content, encoding="utf-8")
+        print(ctext(f"  ✔ Configured .gitignore ({', '.join(to_add_gi)})", "green"))
+
+    if not L.integrity_path(root).exists():
+        L.integrity_refresh(root, pol)
+        print(ctext("  ✔ Initialized integrity manifest", "green"))
+    else:
+        drift = L.integrity_check(root, pol)
+        if drift == ["<no valid integrity manifest: run `helm integrity refresh`>"]:
+            L.integrity_refresh(root, pol)
+            print(ctext("  ✔ Initialized integrity snapshot", "green"))
+        elif drift:
+            clean_drift = [d.replace("changed: ", "• modified: ").replace("added: ", "• added: ").replace("removed: ", "• removed: ") for d in drift]
+            if is_interactive():
+                print(cwarn("Framework files were modified since the last snapshot:"))
+                for d in clean_drift[:5]:
+                    print(ctext(f"  {d}", "dim"))
+                if len(clean_drift) > 5:
+                    print(ctext(f"  ... and {len(clean_drift) - 5} more files", "dim"))
+                print(ctext("  (HELM monitors these files to ensure AI agents cannot alter governance rules.)", "dim"))
+                ans = prompt_user("\n? Did you make these changes and want to update the snapshot? [Y/n]: ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    L.integrity_refresh(root, pol)
+                    print(ctext("✔ Integrity snapshot updated.\n", "green"))
+                else:
+                    die("task start paused.\nInspect changes with `git diff`, or run `helm integrity refresh` when ready.")
+            else:
+                die("framework files were modified since the last snapshot:\n  " +
+                    "\n  ".join(clean_drift[:4]) +
+                    "\nIf intentional, run `helm integrity refresh` to update the baseline.")
+
+    if subprocess.run(["git", "-C", str(root), "check-ignore", "-q", f"{L.WORK_REL}/placeholder/WORK.md"]).returncode != 0:
+        die(f"{L.WORK_REL}/ must be gitignored (else artifacts pollute the diff hash). Add it to .gitignore.")
+
+    # -------------------------------------------------------------------------
+    # 2. Active Task Check & Auto-Recovery (Resume / Abort / Replace)
+    # -------------------------------------------------------------------------
+    active, tampered = L.load_active(root)
+    if tampered:
+        die("task state failed its signature check. Run `helm doctor`")
+    if active:
+        active_task = active.get("task", "unknown")
+        active_kind = active.get("kind", "task")
+        info = L.derive(root, pol, active) if active_kind == "task" else {"phase": "BOOTSTRAP"}
+        phase = info.get("phase", "UNKNOWN")
+
+        if not is_interactive():
+            die(f"an active {active_kind} '{active_task}' is already in progress (phase: {phase}). Finish or abort it first.")
+
+        print(cwarn(f"An active {active_kind} '{active_task}' is already in progress (phase: {phase})."))
+        print("\nSelect recovery option:")
+        print(f"  [1] Resume  — Keep '{active_task}' and view next steps [Default]")
+        print(f"  [2] Abort   — Cancel '{active_task}' and stop")
+        new_desc = f"'{a.id}'" if getattr(a, "id", None) else "a new task"
+        print(f"  [3] Replace — Abort '{active_task}' and start {new_desc}")
+        ans = prompt_user("? Choose option [1/2/3] (1): ").strip()
+
+        if ans in ("", "1"):
+            print(ctext(f"\n✔ Resuming active task '{active_task}'\n", "green"))
+            st = build_status(root, pol)
+            print_status(st)
+            return
+        elif ans == "2":
+            L.append_record(root, active_task, {"gate": "task", "decision": "abort", "user": identity(root), "note": "Aborted via helm start"})
+            decision_md(root, active_task)
+            L.clear_active(root)
+            print(ctext(f"\n✔ Task '{active_task}' aborted. Working tree preserved.\n", "green"))
+            return
+        elif ans == "3":
+            L.append_record(root, active_task, {"gate": "task", "decision": "abort", "user": identity(root), "note": f"Replaced by new task via helm start"})
+            decision_md(root, active_task)
+            L.clear_active(root)
+            print(ctext(f"\n✔ Previous task '{active_task}' aborted. Continuing with new task setup...\n", "yellow"))
+        else:
+            die("invalid option; task start cancelled")
+
+    # -------------------------------------------------------------------------
+    # 3. Git Working Tree Cleanliness Check
+    # -------------------------------------------------------------------------
+    dirty = L.git_out(root, ["status", "--porcelain"])
+    if dirty and not getattr(a, "allow_dirty", False):
+        if is_interactive():
+            print(cwarn("Uncommitted changes detected in working tree."))
+            ans = prompt_user("? Allow starting with uncommitted changes? [Y/n]: ").strip().lower()
+            if ans in ("", "y", "yes"):
+                a.allow_dirty = True
+            else:
+                die("working tree is not clean — commit/stash first (commit the framework files too), or use --allow-dirty:\n" + dirty[:600])
+        else:
+            die("working tree is not clean — commit/stash first (commit the framework files too), or use --allow-dirty:\n" + dirty[:600])
+
+    # -------------------------------------------------------------------------
+    # 4. Context & Ticket Gathering (Atlassian MCP & Task ID Prompts)
+    # -------------------------------------------------------------------------
+    has_mcp, mcp_name, mcp_spec = check_atlassian_mcp(root)
+    story_input = None
+    if has_mcp:
+        clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name))
+        print(ctext(f"✔ Atlassian MCP configured: {clean_name}", "cyan"))
+    else:
+        print(ctext("ℹ Local Story Mode active (Atlassian MCP not connected).", "cyan"))
+        print(ctext("  Requirements will be captured locally in STORY.md.", "dim"))
+
+    if not getattr(a, "id", None):
+        if is_interactive():
+            ans = prompt_user("? Enter Task / Jira ID (e.g. FEAT-101, PROJ-12): ").strip()
+            if not ans:
+                die("task ID is required (e.g. helm start FEAT-101)")
+            a.id = ans
+        else:
+            die("task ID is required (e.g. helm start FEAT-101)")
+    if not L.TASK_ID_RE.match(a.id) or ".." in a.id:
+        die("invalid task id (use letters, digits, . _ -)")
+
+    story_input = getattr(a, "story", None)
+    if not story_input and not has_mcp and is_interactive():
+        story_input = prompt_user("? Enter Story / Requirements summary (or press Enter to describe later): ").strip()
+
+    if has_mcp:
+        print(ctext(f"Checking Jira ticket '{a.id}' via Atlassian MCP...", "dim"))
+        status, details = query_jira_mcp(root, mcp_spec, a.id)
+        if status == "found":
+            print(ctext(f"✔ Jira ticket '{a.id}' verified ({details}).", "green"))
+        elif status == "not_found":
+            print(cwarn(f"Ticket '{a.id}' was not found in Jira."))
+            if is_interactive():
+                ans = prompt_user(f"? Would you like to proceed with '{a.id}' as a custom local ticket? [y/N]: ").strip().lower()
+                if ans not in ("y", "yes"):
+                    die("task cancelled (ticket not found in Jira)")
+                print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
+            else:
+                die(f"ticket '{a.id}' not found in Jira")
+        else:
+            print(cwarn(f"Could not verify ticket '{a.id}' via Jira MCP ({details})."))
+            if is_interactive():
+                ans = prompt_user(f"? Proceed with '{a.id}' as a custom local ticket? [Y/n]: ").strip().lower()
+                if ans in ("n", "no"):
+                    die("task cancelled")
+                print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
+
+    # -------------------------------------------------------------------------
+    # 5. Workflow Tier & Branch Configuration
+    # -------------------------------------------------------------------------
+    if getattr(a, "tier", None) is None:
+        if is_interactive():
+            print("\nSelect workflow tier:")
+            print("  [1] Tier 1 — Quick / Small (Brief + Plan merged into WORK.md, 1 upfront gate) [Default]")
+            print("  [2] Tier 2 — Standard / Complex (Discovery → Plan → Test Plan → Implement → Full Review)")
+            ans = prompt_user("? Choose tier [1/2] (1): ").strip()
+            a.tier = 2 if ans == "2" else 1
+        else:
+            a.tier = 2
+
+    snap = L.git_snapshot(root)
+    branch = snap["branch"]
+
+    if branch in ("main", "master", "develop", "HEAD") and is_interactive():
+        print(cwarn(f"You are currently on `{branch}`. Feature branch recommended before starting."))
+        print("\nSelect branch category:")
+        for idx, (cat, desc) in enumerate(BRANCH_CATEGORIES, 1):
+            default_tag = " [Default]" if idx == 1 else ""
+            print(f"  [{idx}] {cat:<8} — {desc}{default_tag}")
+        ans_cat = prompt_user(f"? Choose branch category [1-{len(BRANCH_CATEGORIES)}] (1): ").strip()
+        cat_idx = int(ans_cat) - 1 if (ans_cat.isdigit() and 1 <= int(ans_cat) <= len(BRANCH_CATEGORIES)) else 0
+        chosen_cat, _ = BRANCH_CATEGORIES[cat_idx]
+
+        if chosen_cat != "skip":
+            desc_prompt = prompt_user("? Enter brief description (e.g. update websocket code): ").strip()
+            desc_slug = slugify(desc_prompt)
+            new_branch = make_branch_name(chosen_cat, a.id, desc_slug)
+
+            confirm_checkout = prompt_user(f"? Create and checkout branch '{new_branch}'? [Y/n]: ").strip().lower()
+            if confirm_checkout in ("", "y", "yes"):
+                rc, out = L.git_run(root, ["checkout", "-b", new_branch])
+                if rc == 0:
+                    print(ctext(f"✔ Created and switched to branch: {new_branch}", "green"))
+                    branch = new_branch
+                    snap = L.git_snapshot(root)
+                else:
+                    err_msg = out.decode("utf-8", "replace").strip()
+                    print(cwarn(f"Could not create branch '{new_branch}': {err_msg}"))
+                    print(ctext(f"Continuing on `{branch}`.", "dim"))
+            else:
+                print(cwarn(f"Skipped branch creation. Remaining on `{branch}`."))
+        else:
+            print(cwarn(f"Skipped branch creation. Remaining on `{branch}`."))
+    elif branch in ("main", "master", "develop", "HEAD"):
+        print(cwarn(f"You are on `{branch}`. Consider a feature branch before starting."))
+
+    # -------------------------------------------------------------------------
+    # 6. Task Registration & Activation
+    # -------------------------------------------------------------------------
+    L.save_task(root, a.id, {"id": a.id, "tier": a.tier, "created": L.now(), "user": identity(root),
+                             "baseline": {"head": snap["head"], "git": snap, "diff": L.diff_sha(root, snap["head"])}})
+    L.set_active(root, {"kind": "task", "task": a.id, "tier": a.tier})
+    wd = root / L.WORK_REL / a.id
+    wd.mkdir(parents=True, exist_ok=True)
+    if story_input:
+        (wd / "STORY.md").write_text(story_input + "\n", encoding="utf-8")
+
+    tier_desc = "Tier 1: Fast-Track (WORK.md)" if a.tier == 1 else "Tier 2: Deep Governance (Multi-Gate)"
+    print("\n" + ctext(f"✔ Task {a.id} registered ({tier_desc})", "green"))
+    print(ctext(f"  • Branch        : {branch}", "dim"))
+    print(ctext(f"  • Git Baseline  : {snap['head'][:8]} (HEAD commit captured for diff boundary)", "dim"))
+    print(ctext(f"  • Workspace     : {L.WORK_REL}/{a.id}/", "dim"))
+    if story_input:
+        print(ctext(f"  • Story File    : {L.WORK_REL}/{a.id}/STORY.md", "dim"))
+    print("\n" + ctext("👉 Next Step (AI Agent Turn):", "bold"))
+    print(f"   Run " + ctext("helm work", "cyan") + " (or in Cursor IDE: " + ctext(f"/work {a.id}", "cyan") + ")")
+    print(ctext("   (The AI agent will inspect the task and draft WORK.md for your approval.)\n", "dim"))
+
+
+def cmd_status(a):
+    root, pol = ctx()
+    st = build_status(root, pol)
+    if a.json:
+        print(json.dumps(st, indent=2, default=list))
+    else:
+        print_status(st, brief=a.brief)
+
+
+def cmd_check(a):
+    root, pol = ctx()
+    active = need_task(root)
+    info = L.derive(root, pol, active)
+    wd = root / info["work_dir"]
+    by_phase = {"DISCOVERY": "WORK", "PLANNING": "PLAN", "TEST_ANALYSIS": "TEST-PLAN", "IMPLEMENTATION": "IMPL",
+                "VERIFICATION": "IMPL", "REVIEW": "REVIEW"}
+    names = list(L.SPECS) if a.artifact == "all" else [a.artifact or by_phase.get(info["phase"])]
+    if names == [None]:
+        print(f"phase {info['phase']}: nothing for the agent to validate")
+        return
+    bad = 0
+    for n in names:
+        if n not in L.SPECS:
+            die(f"unknown artifact {n} (one of {', '.join(L.SPECS)})")
+        if a.artifact == "all" and not (wd / L.SPECS[n]["file"]).exists():
+            continue
+        probs = L.validate(wd, n, info["tier"], root)
+        print(f"{n}: " + ("OK" if not probs else "PROBLEMS"))
+        for p in probs:
+            print(f"  - {p}")
+        bad += bool(probs)
+    sys.exit(1 if bad else 0)
+
+
+def auto_detect_checks(root: Path) -> list[dict]:
+    """Auto-detect verification check suite based on repository technology stack."""
+    checks = []
+
+    # 1. Node.js / TypeScript (package.json)
+    pkg_json = root / "package.json"
+    if pkg_json.exists():
+        try:
+            pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+            scripts = pkg.get("scripts", {})
+            pm = "npm"
+            if (root / "pnpm-lock.yaml").exists() and shutil.which("pnpm"):
+                pm = "pnpm"
+            elif (root / "yarn.lock").exists() and shutil.which("yarn"):
+                pm = "yarn"
+            elif ((root / "bun.lockb").exists() or (root / "bun.lock").exists()) and shutil.which("bun"):
+                pm = "bun"
+
+            test_cmd = scripts.get("test", "")
+            if test_cmd and not ("no test specified" in test_cmd.lower() and "exit 1" in test_cmd.lower()):
+                checks.append({"name": "test", "cmd": f"{pm} test", "required": True})
+            if "typecheck" in scripts:
+                checks.append({"name": "typecheck", "cmd": f"{pm} run typecheck", "required": True})
+            elif "tsc" in scripts:
+                checks.append({"name": "tsc", "cmd": f"{pm} run tsc", "required": True})
+            if "lint" in scripts:
+                checks.append({"name": "lint", "cmd": f"{pm} run lint", "required": False})
+        except Exception:
+            pass
+
+    # 2. Python (pytest, unittest)
+    py_markers = [root / "pytest.ini", root / "pyproject.toml", root / "setup.py", root / "setup.cfg", root / "requirements.txt"]
+    has_py = any(p.exists() for p in py_markers) or list(root.glob("test_*.py")) or list(root.glob("tests/**/test_*.py"))
+    if has_py and not checks:
+        if shutil.which("pytest") or (root / "pytest.ini").exists() or (root / ".venv/bin/pytest").exists():
+            pytest_cmd = str(root / ".venv/bin/pytest") if (root / ".venv/bin/pytest").exists() and not shutil.which("pytest") else "pytest"
+            checks.append({"name": "pytest", "cmd": pytest_cmd, "required": True})
+        elif shutil.which("python3") or shutil.which("python"):
+            py_bin = "python3" if shutil.which("python3") else "python"
+            checks.append({"name": "python-test", "cmd": f"{py_bin} -m unittest discover", "required": True})
+
+    # 3. Rust (Cargo.toml)
+    if (root / "Cargo.toml").exists() and shutil.which("cargo"):
+        checks.append({"name": "cargo-test", "cmd": "cargo test", "required": True})
+
+    # 4. Go (go.mod)
+    if (root / "go.mod").exists() and shutil.which("go"):
+        checks.append({"name": "go-test", "cmd": "go test ./...", "required": True})
+
+    # 5. Makefile
+    if (root / "Makefile").exists() and not checks:
+        try:
+            makefile_txt = (root / "Makefile").read_text(encoding="utf-8")
+            if re.search(r"^test\s*:", makefile_txt, re.MULTILINE):
+                checks.append({"name": "make-test", "cmd": "make test", "required": True})
+        except Exception:
+            pass
+
+    return checks
+
+
+def run_checks(root, only=None, wd=None):
+    cfg = L.load_json(root / L.OVERLAY_REL / "verify.json")
+    checks = cfg.get("checks", []) if cfg else []
+    if not checks:
+        checks = auto_detect_checks(root)
+        if not checks:
+            die("no verification configured and no project test suite auto-detected.\n"
+                "Create `.helm/repo/verify.json` (via `helm bootstrap start`) or configure a test runner.")
+        print(ctext("ℹ Auto-detected verification checks (missing .helm/repo/verify.json):", "dim"))
+
+    results = []
+    for c in checks:
+        if only and c["name"] not in only:
+            continue
+        t0 = time.time()
+        try:
+            r = subprocess.run(shlex.split(c["cmd"]), cwd=root, capture_output=True, text=True, timeout=int(c.get("timeout_s", 900)))
+            code, out = r.returncode, (r.stdout + r.stderr)
+        except subprocess.TimeoutExpired:
+            code, out = 124, "TIMEOUT"
+        except FileNotFoundError as e:
+            code, out = 127, str(e)
+        log = ""
+        if wd is not None:
+            log_file = wd / "verify" / f"{c['name']}.log"
+            if code != 0:
+                (wd / "verify").mkdir(parents=True, exist_ok=True)
+                log_file.write_text("\n".join(out.splitlines()[-200:]) + "\n", encoding="utf-8")
+                log = f"verify/{c['name']}.log"
+            elif log_file.exists():
+                try:
+                    log_file.unlink()
+                except Exception:
+                    pass
+        results.append({"name": c["name"], "cmd": c["cmd"], "required": bool(c.get("required", True)), "exit": code,
+                        "seconds": round(time.time() - t0, 1), "log": log})
+        status_tag = ctext("✔ PASS", "green") if code == 0 else ctext("✘ FAIL", "red")
+        print(f"  {status_tag}  {c['name']:<14} {results[-1]['seconds']}s   {c['cmd']}")
+    return results
+
+
+def cmd_verify(a):
+    root, pol = ctx()
+    active, _ = L.load_active(root)
+    only = set(a.only.split(",")) if a.only else None
+    if not active or active.get("kind") != "task":
+        res = run_checks(root, only)
+        passed = all(r["exit"] == 0 for r in res if r["required"]) and bool(res)
+        print("(no active task: results not recorded)")
+        sys.exit(0 if passed else 1)
+    info = L.derive(root, pol, active)
+    wd = root / info["work_dir"]
+    trec = L.load_task(root, active["task"])
+    before = L.diff_sha(root, trec["baseline"]["head"])
+    res = run_checks(root, only, wd)
+    if only:
+        print("(partial run via --only: not recorded as the verification result)")
+        failed = [r for r in res if r["exit"] != 0 and r["required"]]
+        if failed:
+            for fc in failed:
+                log_path = f"{wd}/verify/{fc['name']}.log"
+                print(ctext(f"  • {fc['name']} failed (exit {fc['exit']}) → error log saved to: {log_path}", "dim"))
+            print("\n" + ctext("👉 Guidance:", "bold"))
+            print("   " + ctext("Run `helm continue` to have the Implementer agent fix this failure.", "bold_orange") + "\n")
+            sys.exit(1)
+        sys.exit(0 if all(r["exit"] == 0 for r in res) else 1)
+    after = L.diff_sha(root, trec["baseline"]["head"])
+    passed = all(r["exit"] == 0 for r in res if r["required"]) and bool(res)
+    note = ""
+    if before != after:
+        passed, note = False, "working tree changed while checks ran (formatter/codegen?) — re-run"
+    L.dump_json(wd / "VERIFY.json", L.signed({"task": active["task"], "diff_sha": after, "ts": L.now(), "passed": passed, "checks": res, "note": note}))
+    if passed:
+        print(ctext("VERIFIED", "green") + f" (diff {after[:10]})" + (f" — {note}" if note else ""))
+        sys.exit(0)
+    else:
+        print(ctext("NOT VERIFIED", "red") + f" (diff {after[:10]})" + (f" — {note}" if note else ""))
+        failed_checks = [r for r in res if r["exit"] != 0 and r["required"]]
+        for fc in failed_checks:
+            log_path = f"{wd}/verify/{fc['name']}.log"
+            print(ctext(f"  • {fc['name']} failed (exit {fc['exit']}) → error log saved to: {log_path}", "dim"))
+        print("\n" + ctext("👉 Guidance:", "bold"))
+        print("   " + ctext("Run `helm continue` to have the Implementer agent fix this failure.", "bold_orange") + "\n")
+        sys.exit(1)
+
+
+def get_cli_runner() -> list[str] | None:
+    """Check for configured HELM_CLI_CMD or common CLI agents."""
+    custom = os.environ.get("HELM_CLI_CMD")
+    if custom:
+        parts = shlex.split(custom)
+        if shutil.which(parts[0]):
+            return parts
+    for cand in ["cursor-agent"]:
+        if shutil.which(cand):
+            return [cand, "-p", "--force", "--trust"]
+    return None
+
+
+def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: str, context_notes: str = "", story_file: Path | None = None, pol: dict | None = None):
+    """Dispatch an AI agent role, running HELM_CLI_CMD if configured, or formatting the exact prompt."""
+    wd_rel = f"{L.WORK_REL}/{task_id}"
+    spec_rel = f".cursor/agents/{role_name}.md"
+
+    def _show_status():
+        try:
+            p = pol if pol is not None else L.load_policy(root)
+            st = build_status(root, p)
+            print_status(st)
+        except Exception:
+            pass
+
+    story_summary = ""
+    if story_file and story_file.exists():
+        try:
+            txt = story_file.read_text(encoding="utf-8").strip()
+            if txt:
+                story_summary = txt[:2000] + ("..." if len(txt) > 2000 else "")
+        except Exception:
+            pass
+
+    prompt_lines = [
+        f"You are the {role_name.capitalize()} role for HELM task {task_id} (Tier {tier}).",
+        f"Follow {spec_rel} and .helm/templates/DISPATCH.md.",
+        f"Task ID: {task_id}",
+        f"Work Directory: {wd_rel}/",
+    ]
+    if story_summary:
+        prompt_lines.append(f"Story Requirements ({wd_rel}/STORY.md):\n{story_summary}")
+    if context_notes:
+        prompt_lines.append(f"Context / Instructions:\n{context_notes}")
+
+    if role_name == "discovery":
+        prompt_lines.append(f"Draft {wd_rel}/WORK.md based on .helm/templates/WORK.md.")
+        if story_summary:
+            prompt_lines.append(f"Extract Objective and Acceptance Criteria from {wd_rel}/STORY.md into {wd_rel}/WORK.md.")
+        prompt_lines.append("Run `helm check WORK` until clean, then inform the user that discovery is ready for approval: `helm approve discovery`.")
+    elif role_name == "planner":
+        prompt_lines.append(f"Draft {wd_rel}/PLAN.md based on .helm/templates/PLAN.md.")
+        prompt_lines.append("Run `helm check PLAN` until clean, then inform the user: `helm approve plan`.")
+    elif role_name == "test-analyst":
+        prompt_lines.append(f"Draft {wd_rel}/TEST-PLAN.md based on .helm/templates/TEST-PLAN.md.")
+        prompt_lines.append("Run `helm check TEST-PLAN` until clean.")
+    elif role_name == "implementer":
+        prompt_lines.append(f"Implement changes in the repository and document them in {wd_rel}/IMPL.md.")
+        prompt_lines.append("Run `helm check IMPL` and run `helm verify` to validate all checks.")
+    elif role_name == "reviewer":
+        prompt_lines.append(f"Review the git diff against baseline and produce {wd_rel}/REVIEW.md based on .helm/templates/REVIEW.md.")
+        prompt_lines.append("Run `helm check REVIEW` until clean.")
+
+    full_prompt = "\n\n".join(prompt_lines)
+    tier_desc = "Tier 1: Fast-Track" if tier == 1 else "Tier 2: Deep Governance"
+
+    border = "─" * 70
+    print(ctext(f"\n┌{border}┐", "cyan"))
+    header = f"  HELM Agent Dispatch: {role_name.upper()}  "
+    print(ctext(f"│{header:<70}│", "bold"))
+    print(ctext(f"├{border}┤", "cyan"))
+    for label, val in [
+        ("Task ID", f"{task_id} ({tier_desc})"),
+        ("Phase", phase),
+        ("Role Spec", spec_rel),
+        ("Workspace", f"{wd_rel}/"),
+    ]:
+        row = f"  {label:<16}: {val}"
+        print(f"│{row:<70}│")
+    if story_file and story_file.exists():
+        sf_row = f"  {'Story File':<16}: {wd_rel}/STORY.md"
+        print(f"│{sf_row:<70}│")
+    print(ctext(f"├{border}┤", "cyan"))
+    prompt_hdr = "  👉 Exact Agent Prompt:"
+    print(ctext(f"│{prompt_hdr:<70}│", "bold"))
+    empty_row = ""
+    for block in prompt_lines:
+        for subline in block.splitlines():
+            if not subline.strip():
+                print(f"│{empty_row:<70}│")
+                continue
+            wrapped = textwrap.wrap(subline, width=64, break_long_words=False, break_on_hyphens=False) or [subline]
+            for wline in wrapped:
+                pline_str = f"    {wline}"
+                print(f"│{pline_str:<70}│")
+        print(f"│{empty_row:<70}│")
+    print(ctext(f"└{border}┘\n", "cyan"))
+
+    runner = get_cli_runner()
+    if runner:
+        print(ctext(f"🚀 Executing via CLI runner: {' '.join(runner)} ...\n", "green"))
+        try:
+            r = subprocess.run(runner + [full_prompt], cwd=root)
+            if r.returncode == 0:
+                print(ctext("\n✔ CLI runner execution completed successfully.", "green"))
+                _show_status()
+                sys.exit(0)
+            else:
+                print(cwarn(f"CLI runner exited with code {r.returncode}."))
+                slash_cmd = "/work " + task_id if role_name == "discovery" else ("/review" if role_name == "reviewer" else "/continue")
+                print(ctext("Proceeding with manual prompt displayed above.", "dim"))
+                print(f"   You can copy the prompt above into your AI agent or run " + ctext(slash_cmd, "cyan") + f" in Cursor IDE.\n")
+                _show_status()
+                sys.exit(r.returncode)
+        except Exception as e:
+            print(cwarn(f"Failed to execute CLI runner: {e}"))
+            print(ctext("Proceeding with manual prompt displayed above.\n", "dim"))
+            _show_status()
+    else:
+        slash_cmd = "/work " + task_id if role_name == "discovery" else ("/review" if role_name == "reviewer" else "/continue")
+        print(ctext("ℹ CLI runner not configured (set HELM_CLI_CMD to auto-execute).", "dim"))
+        print(f"   Copy the prompt above into your AI agent or run " + ctext(slash_cmd, "cyan") + f" in Cursor IDE.\n")
+        _show_status()
+
+
+def cmd_work(a):
+    root, pol = ctx()
+    active = need_task(root)
+    if active.get("kind") != "task":
+        die(f"active item is '{active.get('kind')}', not a task")
+    task_id = active["task"]
+    info = L.derive(root, pol, active)
+    phase = info["phase"]
+    tier = info["tier"]
+    wd = root / info["work_dir"]
+
+    # 1. Ingest / check STORY.md
+    story_arg = getattr(a, "story", None) or getattr(a, "story_flag", None)
+    story_file = wd / "STORY.md"
+    if story_arg:
+        story_file.write_text(story_arg.strip() + "\n", encoding="utf-8")
+        print(ctext(f"✔ Saved story requirements to {L.WORK_REL}/{task_id}/STORY.md", "green"))
+    elif not story_file.exists() and is_interactive():
+        ans = prompt_user("? Enter Story / Requirements summary (or press Enter to describe later): ").strip()
+        if ans:
+            story_file.write_text(ans + "\n", encoding="utf-8")
+            print(ctext(f"✔ Saved story requirements to {L.WORK_REL}/{task_id}/STORY.md", "green"))
+    elif story_file.exists():
+        print(ctext(f"✔ Using story requirements from {L.WORK_REL}/{task_id}/STORY.md", "green"))
+
+    # 2. Check phase
+    if phase == "DISCOVERY":
+        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol)
+    elif phase == "AWAITING_DISCOVERY_APPROVAL":
+        print(ctext(f"Discovery complete for task {task_id}. Awaiting human approval:", "bold_orange"))
+        print(f"Review {info['work_dir']}/WORK.md, then decide:")
+        print(ctext("• To approve : helm approve discovery", "green"))
+        print(ctext("• To reject  : helm reject discovery -m \"your feedback\"", "bold_orange"))
+    elif phase in ("PLANNING", "TEST_ANALYSIS", "IMPLEMENTATION", "VERIFICATION"):
+        print(ctext(f"Task is in {phase} phase (discovery already completed).", "cyan"))
+        print("Dispatching active role via continue...\n")
+        cmd_continue(a)
+    elif phase == "REVIEW":
+        print(ctext(f"Task is in REVIEW phase.", "cyan"))
+        cmd_review(a)
+    else:
+        print(ctext(f"Task {task_id} is in phase {phase}.", "bold_orange"))
+        st = build_status(root, pol)
+        print_status(st)
+
+
+def cmd_continue(a):
+    root, pol = ctx()
+    active = need_task(root)
+    if active.get("kind") != "task":
+        die(f"active item is '{active.get('kind')}', not a task")
+    task_id = active["task"]
+    info = L.derive(root, pol, active)
+    phase = info["phase"]
+    tier = info["tier"]
+    wd = root / info["work_dir"]
+    story_file = wd / "STORY.md"
+
+    if phase == "DISCOVERY":
+        print(ctext(f"Task is in DISCOVERY phase. Dispatching discovery role...", "cyan"))
+        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol)
+    elif phase == "PLANNING":
+        dispatch_role(root, task_id, tier, phase, "planner", story_file=story_file, pol=pol)
+    elif phase == "TEST_ANALYSIS":
+        dispatch_role(root, task_id, tier, phase, "test-analyst", story_file=story_file, pol=pol)
+    elif phase == "IMPLEMENTATION":
+        dispatch_role(root, task_id, tier, phase, "implementer", story_file=story_file, pol=pol)
+    elif phase == "VERIFICATION":
+        vrec = L.load_json(wd / "VERIFY.json", {}) or {}
+        failed_checks = [c["name"] for c in vrec.get("checks", []) if c.get("exit") != 0 and c.get("required")]
+        if not failed_checks and (wd / "verify").exists():
+            failed_checks = [p.stem for p in (wd / "verify").glob("*.log")]
+        notes = ""
+        if failed_checks:
+            notes = f"Fix failing verification checks: {', '.join(failed_checks)}. See logs in {info['work_dir']}/verify/"
+        dispatch_role(root, task_id, tier, phase, "implementer", context_notes=notes, story_file=story_file, pol=pol)
+    elif phase == "REVIEW":
+        dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol)
+    elif phase in GATE_PHASE.values():
+        gate = next((g for g, p in GATE_PHASE.items() if p == phase), None)
+        print(ctext(f"Cannot continue: task is awaiting human approval for '{gate}'.", "bold_orange"))
+        print(f"Review artifact, then decide:")
+        print(ctext(f"• To approve : helm approve {gate}", "green"))
+        print(ctext(f"• To reject  : helm reject {gate} -m \"your feedback\"", "bold_orange"))
+    elif phase == "BLOCKED":
+        print(ctext("Cannot continue: task is BLOCKED.", "red"))
+        print(f"Inspect {info['work_dir']}/BLOCKED.md and unblock via: " + ctext("helm unblock -m \"Decision: ...\"", "cyan"))
+    elif phase == "READY_FOR_DEVELOPER":
+        print(ctext("All agent phases complete! Developer turn:", "green"))
+        print(f"Review `git diff`, commit the changes, then complete task via: " + ctext("helm finish", "cyan"))
+    else:
+        st = build_status(root, pol)
+        print_status(st)
+
+
+def cmd_review(a):
+    root, pol = ctx()
+    active = need_task(root)
+    if active.get("kind") != "task":
+        die(f"active item is '{active.get('kind')}', not a task")
+    task_id = active["task"]
+    info = L.derive(root, pol, active)
+    phase = info["phase"]
+    tier = info["tier"]
+    wd = root / info["work_dir"]
+    story_file = wd / "STORY.md"
+
+    if phase not in ("REVIEW", "AWAITING_FINAL_APPROVAL", "IMPLEMENTATION", "VERIFICATION"):
+        print(cwarn(f"Review dispatched while task is in phase '{phase}' (normally run in REVIEW phase)."))
+
+    dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol)
+
+
+def cmd_approve(a):
+    root, pol = ctx()
+    active = need_task(root)
+    info = L.derive(root, pol, active)
+    task = active["task"]
+    tier = info["tier"]
+
+    gate_auto = False
+    if not getattr(a, "gate", None):
+        if not is_interactive() and not _has_tty():
+            die("gate is required in non-interactive mode: helm approve discovery|plan|final")
+        if info["phase"] in PHASE_TO_GATE:
+            a.gate = PHASE_TO_GATE[info["phase"]]
+            gate_auto = True
+        else:
+            die(f"active task is in phase '{info['phase']}'; no gate is pending approval")
+
+    gate = a.gate
+    if info["phase"] != GATE_PHASE[gate]:
+        die(f"phase is {info['phase']}; the `{gate}` gate can only be approved in {GATE_PHASE[gate]}")
+    preflight(root, pol, active, info, strict_tree=info["phase"] in PRE_IMPL)
+    wd = root / info["work_dir"]
+
+    print(ctext(f"\n=== Approve gate: {gate.upper()}  (task {task}, tier {tier}) ===", "bold"))
+    extra = None
+    if gate in ("discovery", "plan"):
+        name = "WORK" if gate == "discovery" else "PLAN"
+        probs = L.validate(wd, name, tier)
+        if probs:
+            die(f"{name}.md fails validation:\n  " + "\n  ".join(probs))
+        art_path = wd / L.SPECS[name]["file"]
+        meta, body = L.read_meta(art_path)
+        art_sha_val = L.art_sha(wd, name)[:12]
+        line_count = len(art_path.read_text(encoding="utf-8", errors="replace").splitlines())
+        print(f"Artifact    : {ctext(L.SPECS[name]['file'], 'cyan')}  sha {art_sha_val}  ({line_count} lines)")
+        print(f"Open in IDE : {ctext(f'code {art_path.relative_to(root)}', 'green')}")
+        print(f"[inferred] tags: {body.count('[inferred]')}   assumptions: {len([l for l in L.section(body, 'Assumptions').splitlines() if l.strip().startswith(('-', '*'))])}")
+        oq = L.section(body, "Open Questions")
+        unresolved = [l for l in oq.splitlines() if l.strip().startswith(("- [ ]", "* [ ]"))]
+        print("Open questions:\n  " + ("\n  ".join(unresolved) if unresolved else (oq.strip()[:200] or "(none stated)")))
+        if gate == "discovery" and tier == 1:
+            print("Tier 1: approving brief AND plan together (## Plan section).")
+        if unresolved:
+            extra = "accept open questions"
+    else:
+        diff = info["diff_sha"]
+        trec = L.load_task(root, task)
+        print(L.git_out(root, ["diff", "--stat", trec["baseline"]["head"], "--"]) or "(no tracked changes)")
+        untracked = L.git_out(root, ["ls-files", "--others", "--exclude-standard"]).splitlines()
+        if untracked:
+            print("New files: " + ", ".join(untracked[:15]))
+        V = L.verify_record(wd)
+        print("Verification: " + ("PASSED" if V and V["passed"] else "NOT PASSED") + " — " + ", ".join(f"{c['name']}={'ok' if c['exit'] == 0 else 'FAIL'}" for c in (V or {}).get("checks", [])))
+        rmeta, rbody = L.read_meta(wd / "REVIEW.md") if (wd / "REVIEW.md").exists() else ({}, "")
+        verdict = rmeta.get("verdict", "(no review for this diff)")
+        if (wd / "REVIEW.md").exists():
+            rev_rel = (wd / "REVIEW.md").relative_to(root)
+            print(f"Open in IDE : {ctext(f'code {rev_rel}', 'green')}")
+        if (wd / "REVIEW.md").exists() and rmeta.get("diff_sha") == diff:
+            rprobs = L.validate(wd, "REVIEW", tier, root)
+            if rprobs:
+                die("REVIEW.md fails validation:\n  " + "\n  ".join(rprobs))
+            tr = L.traceability(root, wd)
+            c = tr["counts"]
+            print(f"Traceability: {tr['criteria']} criteria → {c['pass']} proven by a test file, {c['manual']} manual, {c['unproven']} unproven, {c['fail']} failing")
+        print(f"Review verdict: {verdict}")
+        if rbody:
+            print("  " + "\n  ".join(L.section(rbody, "Findings").splitlines()[:14]))
+        if verdict == "CHANGES_REQUIRED" and not a.override:
+            die("reviewer says CHANGES_REQUIRED. Reject with `helm reject final -m ...`, or approve anyway with --override.")
+        pfile = wd / ("PLAN.md" if L.tier_cfg(pol, tier)["plan_stage"] else "WORK.md")
+        pbody = L.read_meta(pfile)[1]
+        planned = section_paths(L.section(pbody, "Files Likely To Change" if pfile.name == "PLAN.md" else "Plan"))
+        unplanned = [f for f in L.changed_files(root, trec["baseline"]["head"]) if planned and not is_planned(f, planned)]
+        if unplanned:
+            print("SCOPE: files changed that the approved plan did not list:\n  " + "\n  ".join(unplanned[:20]))
+
+    if gate_auto:
+        ans = prompt_user(f"\nApprove {gate} for task {task}? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            die("not confirmed — nothing recorded")
+    else:
+        if not confirm(f"\nType the task id ({task}) to approve the {gate} gate: ", task):
+            die("not confirmed — nothing recorded")
+
+    if extra and not confirm(f"Open questions remain. Type '{extra}' to proceed anyway: ", extra):
+        die("not confirmed — nothing recorded")
+    inputs = L.final_inputs(wd, info["diff_sha"]) if gate == "final" else L.gate_inputs(wd, gate)
+    L.append_record(root, task, {"gate": gate, "decision": "approve", "inputs": inputs, "user": identity(root), "note": "override" if a.override else ""})
+    decision_md(root, task)
+    print(ctext(f"recorded: {gate} approved.  Next: /continue in Cursor.", "green"))
+
+
+def cmd_reject(a):
+    root, pol = ctx()
+    active = need_task(root)
+    info = L.derive(root, pol, active)
+    if not getattr(a, "gate", None):
+        if is_interactive() and info["phase"] in PHASE_TO_GATE:
+            a.gate = PHASE_TO_GATE[info["phase"]]
+        else:
+            die("gate is required in non-interactive mode: helm reject <gate> -m '<message>'")
+    gate, task = a.gate, active["task"]
+    if info["phase"] != GATE_PHASE[gate]:
+        die(f"phase is {info['phase']}; `{gate}` can only be rejected in {GATE_PHASE[gate]}")
+    require_tty()
+    if not getattr(a, "message", None):
+        if is_interactive():
+            ans = prompt_user(f"? Enter rejection feedback / reason for {gate}: ").strip()
+            if not ans:
+                die("rejection message cannot be empty")
+            a.message = ans
+        else:
+            die("-m / --message is required")
+    wd = root / info["work_dir"]
+    inputs = L.final_inputs(wd, info["diff_sha"]) if gate == "final" else L.gate_inputs(wd, gate)
+    L.append_record(root, task, {"gate": gate, "decision": "reject", "inputs": inputs, "user": identity(root), "note": a.message})
+    feedback(root, task, f"**{gate} REJECTED.** {a.message}")
+    decision_md(root, task)
+    print(ctext(f"recorded: {gate} rejected; feedback written to {info['work_dir']}/FEEDBACK.md. Next: /continue.", "yellow"))
+
+
+def cmd_unblock(a):
+    root, pol = ctx()
+    active = need_task(root)
+    info = L.derive(root, pol, active)
+    if info["phase"] != "BLOCKED":
+        die(f"phase is {info['phase']}, not BLOCKED")
+    require_tty()
+    if not getattr(a, "message", None):
+        if is_interactive():
+            ans = prompt_user("? Enter unblock decision / instruction: ").strip()
+            if not ans:
+                die("unblock decision message cannot be empty")
+            a.message = ans
+        else:
+            die("-m / --message is required")
+    wd = root / info["work_dir"]
+    b = wd / "BLOCKED.md"
+    n = len(list(wd.glob("BLOCKED.resolved-*.md"))) + 1
+    if b.exists():
+        b.rename(wd / f"BLOCKED.resolved-{n}.md")
+    L.append_record(root, active["task"], {"gate": "block", "decision": "resolve", "user": identity(root), "note": a.message})
+    feedback(root, active["task"], f"**HUMAN DECISION (unblock {n}):** {a.message}")
+    decision_md(root, active["task"])
+    print(ctext("unblocked. Next: /continue (the agent will fold your decision into the artifacts).", "green"))
+
+
+def cmd_setup(a):
+    root, pol = ctx()
+    models, mpath = load_models(root)
+    print(ctext("\n=== HELM Agent Model Configuration ===", "bold"))
+    print(ctext("Configure specialized models for architecture planning and independent review.\n", "dim"))
+
+    for role, rel_path in [("Planner", ".cursor/agents/planner.md"), ("Reviewer", ".cursor/agents/reviewer.md")]:
+        target = root / rel_path
+        if not target.exists():
+            payload_target = root / "payload" / rel_path
+            if payload_target.exists():
+                target = payload_target
+        cur_model = "inherit"
+        if target.exists():
+            meta, _ = L.read_meta(target)
+            cur_model = meta.get("model", "inherit")
+
+        print(ctext(f"\nSelect model for {role} ({rel_path}):", "bold"))
+        print(f"Current setting: {ctext(cur_model, 'cyan')}")
+        for idx, m in enumerate(models, 1):
+            default_tag = " [Default]" if m["id"] == "inherit" else ""
+            print(f"  [{idx}] {m['id']:<20} ({m.get('name', m['id'])}){default_tag}")
+        print(f"  [{len(models) + 1}] Enter custom model identifier...")
+
+        sel = prompt_user(f"Choose [1-{len(models) + 1}] (1): ").strip()
+        if not sel:
+            sel = "1"
+
+        chosen_id = None
+        is_reasoning = False
+        try:
+            choice_num = int(sel)
+            if 1 <= choice_num <= len(models):
+                chosen_id = models[choice_num - 1]["id"]
+                is_reasoning = models[choice_num - 1].get("reasoning", False)
+            elif choice_num == len(models) + 1:
+                while True:
+                    custom = prompt_user("Enter model identifier as configured in Cursor: ").strip()
+                    if not re.match(r"^[A-Za-z0-9._-]+$", custom):
+                        print(ctext("Invalid model identifier (use letters, numbers, '.', '_', '-')", "red"))
+                        continue
+                    chosen_id = custom
+                    r_ans = prompt_user(f"Does {custom} support reasoning effort? [y/N]: ").strip().lower()
+                    is_reasoning = r_ans in ("y", "yes")
+                    models.append({"id": chosen_id, "name": chosen_id, "reasoning": is_reasoning})
+                    L.dump_json(mpath, {"models": models})
+                    print(ctext(f"Added {chosen_id} to {mpath.name}", "green"))
+                    break
+        except ValueError:
+            chosen_id = sel if re.match(r"^[A-Za-z0-9._-]+$", sel) else "inherit"
+
+        reasoning_effort = None
+        if is_reasoning and chosen_id != "inherit":
+            print(f"\nSelect reasoning effort for {chosen_id}:")
+            print("  [1] medium [Default]")
+            print("  [2] high")
+            print("  [3] low")
+            e_sel = prompt_user("Choose effort [1-3] (1): ").strip()
+            efforts = {"1": "medium", "2": "high", "3": "low"}
+            reasoning_effort = efforts.get(e_sel, "medium")
+
+        updated_any = False
+        for p in [root / rel_path, root / "payload" / rel_path]:
+            if p.exists():
+                update_agent_model(p, chosen_id, reasoning_effort)
+                updated_any = True
+                print(ctext(f"  ✔ Updated {p.relative_to(root)} -> model: {chosen_id}" + (f", effort: {reasoning_effort}" if reasoning_effort else ""), "green"))
+
+    L.ensure_key()
+    L.integrity_refresh(root, pol)
+    print(ctext("\n✔ Integrity manifest refreshed (helm integrity refresh)", "green"))
+    print(ctext("Specialized models configured successfully.\n", "bold"))
+
+
+
+def cmd_violations(a):
+    root, pol = ctx()
+    active = need_task(root)
+    recs = [r for r in L.load_records(root, active["task"]) if r["gate"] == "violation"]
+    for r in recs:
+        print(f"{r['ts']} {r['decision']:<6} {r.get('note', '')}")
+    if a.ack:
+        require_tty()
+        if not a.message:
+            die("-m is required with --ack")
+        L.append_record(root, active["task"], {"gate": "violation", "decision": "ack", "user": identity(root), "note": a.message})
+        print("acknowledged. Review `git status` for any unintended edits before continuing.")
+
+
+def cmd_abort(a):
+    root, pol = ctx()
+    active = need_task(root)
+    if not confirm(f"Type the task id ({active['task']}) to ABORT: ", active["task"]):
+        die("not confirmed")
+    L.append_record(root, active["task"], {"gate": "task", "decision": "abort", "user": identity(root), "note": a.message or ""})
+    decision_md(root, active["task"])
+    L.clear_active(root)
+    print("aborted. Working-tree changes (if any) are yours to keep or revert with Git.")
+
+
+def cmd_finish(a):
+    root, pol = ctx()
+    active = need_task(root)
+    info = L.derive(root, pol, active)
+    if info["phase"] != "READY_FOR_DEVELOPER":
+        die(f"phase is {info['phase']}; finish is only possible in READY_FOR_DEVELOPER")
+    trec = L.load_task(root, active["task"])
+    gv = L.git_violations(trec["baseline"]["git"], L.git_snapshot(root))
+    if gv:
+        print("note: Git state differs from task start (" + ", ".join(gv) + ") — expected if you already committed.")
+    if not confirm(f"Type the task id ({active['task']}) to finish: ", active["task"]):
+        die("not confirmed")
+    cands = L.decision_candidates(root, active["task"])
+    if cands:
+        log = pol.get("decisions_log", "docs/decisions.md")
+        print(f"\nHuman decisions made during this task:")
+        for i, c in enumerate(cands, 1):
+            print(f"  {i}. {c[:160]}")
+        ans = ask_tty(f"Promote which to {log}? (numbers like 1,3 / 'all' / blank to skip): ").lower()
+        chosen = cands if ans == "all" else [cands[int(x) - 1] for x in re.findall(r"\d+", ans) if 0 < int(x) <= len(cands)]
+        if chosen:
+            rel = L.promote_decisions(root, pol, active["task"], chosen)
+            L.integrity_refresh(root, pol)
+            print(f"appended {len(chosen)} decision(s) to {rel} (review and commit it with your change)")
+    L.append_record(root, active["task"], {"gate": "task", "decision": "finish", "user": identity(root), "note": ""})
+    log = decision_md(root, active["task"])
+    L.clear_active(root)
+    wd = root / info["work_dir"]
+    if a.clean:
+        print(log)
+        shutil.rmtree(wd, ignore_errors=True)
+        print(f"\nremoved {info['work_dir']}")
+    else:
+        print(f"kept {info['work_dir']}/ (gitignored). Remove later with: rm -r {info['work_dir']}")
+    print("AI work ended. You own the branch: commit, push and open the PR yourself.")
+
+
+def cmd_baseline(a):
+    root, pol = ctx()
+    active = need_task(root)
+    require_tty()
+    trec = L.load_task(root, active["task"])
+    snap = L.git_snapshot(root)
+    if not confirm(f"Re-baseline Git state to HEAD {snap['head'][:8]} (approvals bound to the old diff become invalid). Type 'baseline': ", "baseline"):
+        die("not confirmed")
+    trec["baseline"] = {"head": snap["head"], "git": snap, "diff": L.diff_sha(root, snap["head"])}
+    L.save_task(root, active["task"], trec)
+    print("baseline refreshed")
+
+
+def cmd_integrity(a):
+    root, pol = ctx()
+    if a.action == "check":
+        d = L.integrity_check(root, pol)
+        print("integrity: ok" if not d else "integrity DRIFT:\n  " + "\n  ".join(d))
+        sys.exit(1 if d else 0)
+    require_tty()
+    d = L.integrity_check(root, pol)
+    print("changes since last refresh:\n  " + ("\n  ".join(d) if d else "(none)"))
+    if not confirm("Type 'refresh' to accept the current framework/protected files as trusted: ", "refresh"):
+        die("not confirmed")
+    L.ensure_key()
+    L.integrity_refresh(root, pol)
+    print("integrity manifest refreshed")
+
+
+def cmd_bootstrap(a):
+    root, pol = ctx()
+    prop = root / L.BOOT_REL
+    active, tampered = L.load_active(root)
+    if a.action == "start":
+        if tampered or active:
+            die("another task/bootstrap is active (helm status)")
+        if subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".helm/bootstrap/proposal/x"]).returncode != 0:
+            die(".helm/bootstrap/ must be gitignored")
+        L.ensure_key()
+        prop.mkdir(parents=True, exist_ok=True)
+        L.set_active(root, {"kind": "bootstrap"})
+        print(f"bootstrap started. In Cursor run:  /bootstrap\nThen review {L.BOOT_REL}/ and run:  helm bootstrap accept")
+        return
+    if not active or active.get("kind") != "bootstrap":
+        die("no bootstrap in progress (helm bootstrap start)")
+    if a.action == "abort":
+        shutil.rmtree(prop, ignore_errors=True)
+        L.clear_active(root)
+        print("bootstrap aborted")
+        return
+    # accept
+    need = ["README.md", "repository-map.md", "conventions.md", "testing.md", "verify.json", "policy.local.json"]
+    miss = [n for n in need if not (prop / n).exists()]
+    if miss:
+        die("proposal incomplete, missing: " + ", ".join(miss))
+    meta, _ = L.read_meta(prop / "README.md")
+    if meta.get("status") != "ready":
+        die("proposal README.md front matter must say `status: ready`")
+    ver = L.load_json(prop / "verify.json")
+    if not isinstance(ver, dict) or not isinstance(ver.get("checks"), list) or not ver["checks"] or \
+            not all(isinstance(c, dict) and c.get("name") and c.get("cmd") for c in ver["checks"]):
+        die("verify.json must be {\"checks\": [{\"name\":..., \"cmd\":..., \"required\":true}, ...]} with at least one check")
+    loc = L.load_json(prop / "policy.local.json")
+    if not isinstance(loc, dict):
+        die("policy.local.json is not valid JSON")
+    dropped = set(loc) - set(L.sanitize_overlay(loc))
+    print("\n=== Bootstrap proposal ===")
+    existing = root / L.OVERLAY_REL
+    for p in sorted(prop.rglob("*")):
+        if p.is_file():
+            rel = p.relative_to(prop).as_posix()
+            print(f"  {rel:<28} {len(p.read_text(errors='replace').splitlines()):>4} lines   " + ("(replaces existing)" if (existing / rel).exists() else "(new)"))
+    print("\nPolicy additions requested:\n" + json.dumps(L.sanitize_overlay(loc), indent=2))
+    if dropped:
+        print("Ignored (not permitted in an overlay): " + ", ".join(sorted(dropped)))
+    print("Verification commands that `helm verify` will execute:")
+    for c in ver["checks"]:
+        print(f"  {c['name']}: {c['cmd']}")
+    if not confirm("\nRead the files above. Type 'accept' to adopt them as the repo layer: ", "accept"):
+        die("not confirmed — nothing changed")
+    if existing.exists():
+        shutil.rmtree(existing)
+    shutil.copytree(prop, existing)
+    L.dump_json(existing / "META.json", {"commit": L.git_out(root, ["rev-parse", "HEAD"]), "accepted": L.now(), "by": identity(root), "framework": L.FRAMEWORK_VERSION})
+    shutil.rmtree(prop.parent, ignore_errors=True)
+    L.clear_active(root)
+    L.integrity_refresh(root, pol)
+    print(f"accepted → {L.OVERLAY_REL}/ . Commit it so the team shares it:  git add {L.OVERLAY_REL} && git commit")
+
+
+# ---------------------------------------------------------------- skills
+SKILL_DIRS = [".cursor/skills", ".agents/skills", ".claude/skills", ".codex/skills"]
+RISKY = re.compile(r"(?i)ignore (all |any )?(previous|prior) instructions|curl |wget |base64|eval\(|exec\(|child_process|subprocess|os\.system|rm -rf|sudo |\.ssh|api[_-]?key|BEGIN (RSA|OPENSSH)|pip install|npm install")
+TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".mdx"}
+
+
+def folder_hash(d: Path):
+    h, files = L.hashlib.sha256(), []
+    for p in sorted(x for x in d.rglob("*") if x.is_file()):
+        rel = p.relative_to(d).as_posix()
+        files.append(rel)
+        h.update(rel.encode() + b"\0" + L.sha256_file(p).encode() + b"\0")
+    return h.hexdigest(), files
+
+
+def discovered_skills(root):
+    found = {}
+    homes = [Path.home() / ".cursor/skills", Path.home() / ".claude/skills", Path.home() / ".agents/skills", Path.home() / ".codex/skills"]
+    for base in homes:
+        try:
+            if base.is_dir():
+                for s in base.iterdir():
+                    if (s / "SKILL.md").exists():
+                        found[str(s)] = ("user", s)
+        except OSError:
+            pass
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in (".git", "node_modules", ".helm")]
+        if "SKILL.md" in fn:
+            found[dp] = ("repo", Path(dp))
+    return found
+
+
+def skills_verify(root, quiet=False):
+    lock = L.load_json(root / ".helm/skills.lock.json", {"skills": []})
+    problems, approved = [], {}
+    for s in lock.get("skills", []):
+        d = root / ".cursor/skills" / s["name"]
+        approved[str(d)] = s
+        if not d.is_dir():
+            problems.append(f"approved skill missing on disk: {s['name']}")
+        elif folder_hash(d)[0] != s["content_sha"]:
+            problems.append(f"HASH MISMATCH (modified since approval): {s['name']}")
+    for path, (where, p) in discovered_skills(root).items():
+        if path not in approved:
+            problems.append(f"UNAPPROVED skill that Cursor will discover ({where}): {path}")
+    if not quiet:
+        print(f"{len(lock.get('skills', []))} approved skill(s)")
+        for pr in problems:
+            print(f"  ✘ {pr}")
+        if not problems:
+            print("  ✔ all discovered skills are approved and unmodified")
+    return problems
+
+
+def cmd_skills(a):
+    root, pol = ctx()
+    if a.action == "list":
+        for s in L.load_json(root / ".helm/skills.lock.json", {"skills": []})["skills"]:
+            print(f"{s['name']:<28} {s['license']:<10} {s['commit'][:10]}  reviewer={s['reviewer']}  scope={s.get('scope', '')}")
+        return
+    if a.action == "verify":
+        sys.exit(1 if skills_verify(root) else 0)
+    require_tty()
+    src = Path(a.src).resolve()
+    if not (src / "SKILL.md").exists():
+        die("source folder has no SKILL.md")
+    bad_files = [p.relative_to(src).as_posix() for p in src.rglob("*") if p.is_file() and p.suffix.lower() not in TEXT_EXT]
+    if bad_files and not a.allow_scripts:
+        die("non-text files found (scripts/binaries need extra review; re-run with --allow-scripts after reviewing):\n  " + "\n  ".join(bad_files[:15]))
+    hits = []
+    for p in src.rglob("*"):
+        if p.is_file() and p.suffix.lower() in TEXT_EXT:
+            for i, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
+                if RISKY.search(line):
+                    hits.append(f"{p.relative_to(src)}:{i}: {line.strip()[:110]}")
+    print(f"Skill `{a.name}` from {a.source} @ {a.sha}")
+    print("Risky-pattern hits (read each!):\n  " + ("\n  ".join(hits[:40]) if hits else "(none)"))
+    dest = root / ".cursor/skills" / a.name
+    if dest.exists():
+        die(f"{dest} already exists; remove it deliberately first")
+    if not confirm(f"I have read this skill's files in full. Type '{a.name}' to vendor it: ", a.name):
+        die("not confirmed")
+    shutil.copytree(src, dest)
+    chash, files = folder_hash(dest)
+    lock = L.load_json(root / ".helm/skills.lock.json", {"skills": []})
+    lock["skills"].append({"name": a.name, "source": a.source, "commit": a.sha, "license": a.license, "reviewer": a.reviewer,
+                           "approved": time.strftime("%Y-%m-%d"), "scope": a.scope or "", "content_sha": chash,
+                           "files": files, "has_scripts": bool(bad_files)})
+    L.dump_json(root / ".helm/skills.lock.json", lock)
+    L.integrity_refresh(root, pol)
+    print(f"vendored to {dest.relative_to(root)} and locked. Commit both; CODEOWNERS should cover .cursor/ and .helm/.")
+
+
+# ---------------------------------------------------------------- doctor
+def doctor_checks(root, pol):
+    out = []
+    add = lambda lvl, msg: out.append((lvl, msg))
+    add("PASS" if sys.version_info >= (3, 9) else "FAIL", f"python {sys.version.split()[0]} (need ≥ 3.9)")
+    add("PASS" if (L.key_path().exists() and (L.key_path().stat().st_mode & 0o077) == 0) else "FAIL",
+        f"signing key {L.key_path()} exists with owner-only permissions" if L.key_path().exists() else "no signing key: run `helm init`")
+    hooks = L.load_json(root / ".cursor/hooks.json", {})
+    hk = (hooks or {}).get("hooks", {})
+    for ev in ("beforeShellExecution", "beforeMCPExecution", "preToolUse", "beforeReadFile", "subagentStart", "afterFileEdit"):
+        ent = [e for e in hk.get(ev, []) if "helm_guard.py" in e.get("command", "")]
+        if not ent:
+            add("FAIL", f"hooks.json: no HELM guard on `{ev}`")
+        elif ev != "afterFileEdit" and ev != "subagentStart" and not all(e.get("failClosed") is True for e in ent):
+            add("FAIL", f"hooks.json: `{ev}` guard is not failClosed:true (crash/timeout would FAIL OPEN)")
+        else:
+            add("PASS", f"hooks.json: `{ev}` wired")
+    cli = L.load_json(root / ".cursor/cli.json", {}) or {}
+    denies = (cli.get("permissions") or {}).get("deny", [])
+    add("PASS" if any("Shell(gh)" == d for d in denies) and any(d.startswith("Read(") for d in denies) else "WARN",
+        ".cursor/cli.json permissions deny-list present" if denies else ".cursor/cli.json deny-list missing (CLI second layer)")
+    gi = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".helm/work/x/WORK.md"]).returncode == 0
+    add("PASS" if gi else "FAIL", ".helm/work/ is gitignored" if gi else ".helm/work/ is NOT gitignored (diff hash would be polluted)")
+    ag = (root / "AGENTS.md").read_text(errors="replace") if (root / "AGENTS.md").exists() else ""
+    add("PASS" if "HELM:BEGIN" in ag else "FAIL", "AGENTS.md contains the HELM constitution block" if "HELM:BEGIN" in ag else "AGENTS.md has no HELM block")
+    drift = L.integrity_check(root, pol)
+    add("PASS" if not drift else "FAIL", "integrity manifest matches" if not drift else "integrity: " + "; ".join(drift[:3]))
+    sp = skills_verify(root, quiet=True)
+    add("PASS" if not sp else "FAIL", "skills: all discovered skills approved + unmodified" if not sp else f"skills: {len(sp)} problem(s) — run `helm skills verify`")
+    mcps = {}
+    for f in (root / ".cursor/mcp.json", Path.home() / ".cursor/mcp.json"):
+        mcps.update(((L.load_json(f, {}) or {}).get("mcpServers", {})))
+    allowed = set(pol["mcp"]["allow_servers"])
+    extra = sorted(set(mcps) - allowed)
+    add("WARN" if extra else "PASS", f"MCP servers not on allowlist (will be DENIED by the guard): {', '.join(extra)}" if extra else "MCP servers match the allowlist")
+    if allowed and not (allowed & set(mcps)):
+        add("WARN", f"no configured MCP server matches allow_servers {sorted(allowed)} — set the real name via the bootstrap overlay")
+    ov = overlay_info(root, pol)
+    add("PASS" if ov["present"] else "WARN", "repo overlay present" + (f" (STALE: {len(ov['stale_files'])} watched files changed)" if ov.get("stale_files") else "") if ov["present"] else "no repo overlay yet: `helm bootstrap start`")
+    co = [root / "CODEOWNERS", root / ".github/CODEOWNERS", root / "docs/CODEOWNERS"]
+    cot = "".join(p.read_text(errors="replace") for p in co if p.exists())
+    add("PASS" if ".cursor" in cot and ".helm" in cot else "WARN", "CODEOWNERS covers .cursor/ and .helm/" if (".cursor" in cot and ".helm" in cot) else "CODEOWNERS does not cover .cursor/ and .helm/ (framework changes unreviewed)")
+    add("INFO", "managed hooks at /etc/cursor/hooks.json: " + ("present" if Path("/etc/cursor/hooks.json").exists() else "absent (project hooks are agent-reachable only via protected-path rules; ask IT for managed hooks)"))
+    fails = G.selftest(root)
+    add("PASS" if not fails else "FAIL", f"guard policy self-test: {len(G.SELFTEST)} cases" if not fails else "guard self-test failures: " + " | ".join(fails[:3]))
+    return out
+
+
+def live_check(root):
+    cli = shlex.split(os.environ.get("HELM_CLI_CMD", "cursor-agent -p --force --trust"))
+    if not shutil.which(cli[0]):
+        return [("FAIL", f"`{cli[0]}` not on PATH (set HELM_CLI_CMD to your Cursor CLI invocation)")]
+    res = []
+    for label, tmpl in (("main-agent", "Run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}"),
+                        ("subagent", "Use a subagent (Task tool) to run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}")):
+        n = secrets.token_hex(4) + label[:3]
+        try:
+            subprocess.run(cli + [tmpl.format(n=n)], cwd=root, capture_output=True, text=True, timeout=240)
+        except Exception as e:
+            res.append(("FAIL", f"{label}: could not run CLI ({e})"))
+            continue
+        seen = False
+        p = L.state_dir(root) / "audit" / "_doctor.jsonl"
+        if p.exists():
+            seen = any(f"\"nonce\": \"{n}\"" in line for line in p.read_text().splitlines())
+        res.append(("PASS" if seen else "FAIL", f"{label}: hook fired and denied the canary" if seen else
+                    f"{label}: hooks did NOT fire (canary never reached the guard) — enforcement is NOT active on this route"))
+    return res
+
+
+def cmd_doctor(a):
+    root, pol = ctx()
+    if a.probe:
+        p = L.state_dir(root) / "audit" / "_probe.jsonl"
+        print(p.read_text() if p.exists() else "no probe data. Run Cursor with HELM_PROBE=1 in the environment, do a few edits/reads, then re-run.")
+        return
+    res = doctor_checks(root, pol)
+    if a.live:
+        res += live_check(root)
+    lvl_color = {"PASS": "green", "WARN": "bold_orange", "FAIL": "red", "INFO": "cyan"}
+    for lvl, msg in res:
+        tag = ctext(f"[{lvl:<4}]", lvl_color.get(lvl, "dim"))
+        print(f"{tag} {msg}")
+    fails = sum(1 for l, _ in res if l == "FAIL")
+    print(f"\n{fails} failure(s). " + ("Do NOT start tasks until these are fixed." if fails else "Static checks pass. Run `helm doctor --live` to prove hooks fire through the real Cursor CLI."))
+    sys.exit(1 if fails else 0)
+
+
+def ci_checks(root, pol, base=None, require_overlay=False):
+    """Key-free, state-free checks that are safe to run in CI (they do not depend on Cursor hooks)."""
+    out = []
+    add = lambda lvl, msg: out.append((lvl, msg))
+    hk = (L.load_json(root / ".cursor/hooks.json", {}) or {}).get("hooks", {})
+    for ev in ("beforeShellExecution", "beforeMCPExecution", "preToolUse", "beforeReadFile", "subagentStart"):
+        ent = [e for e in hk.get(ev, []) if "helm_guard.py" in e.get("command", "")]
+        ok = bool(ent) and all(e.get("failClosed") is True for e in ent)
+        add("PASS" if ok else "FAIL", f"hooks.json `{ev}`: guard wired and failClosed" if ok else f"hooks.json `{ev}`: guard missing or not failClosed:true")
+    ag = (root / "AGENTS.md").read_text(errors="replace") if (root / "AGENTS.md").exists() else ""
+    add("PASS" if "HELM:BEGIN" in ag else "FAIL", "AGENTS.md has the HELM block")
+    try:
+        import re as _re
+        _re.compile(pol["mcp"]["allow_tool_regex"])
+        risky = [v for v in ("create", "edit", "update", "delete", "add", "transition", "comment") if _re.search(pol["mcp"]["allow_tool_regex"], v + "Thing")]
+        add("FAIL" if risky else "PASS", f"mcp.allow_tool_regex admits write-looking tools: {risky}" if risky else "mcp.allow_tool_regex is read-verbs only")
+    except Exception as e:
+        add("FAIL", f"policy mcp section invalid: {e}")
+    sp = skills_verify(root, quiet=True)
+    add("PASS" if not sp else "FAIL", "skills: approved + unmodified" if not sp else "skills: " + "; ".join(sp[:3]))
+    tracked = L.git_out(root, ["ls-files", ".helm/work", ".helm/bootstrap"]).splitlines()
+    add("PASS" if not tracked else "FAIL", "no task artifacts tracked in git" if not tracked else f"task artifacts are committed (may hold Jira content): {tracked[:3]}")
+    fails = G.selftest(root)
+    add("PASS" if not fails else "FAIL", f"guard policy self-test ({len(G.SELFTEST)} cases)" if not fails else "guard self-test: " + " | ".join(fails[:2]))
+    ov = overlay_info(root, pol)
+    if not ov["present"]:
+        add("FAIL" if require_overlay else "WARN", "no accepted repo overlay (.helm/repo/)")
+    elif ov["stale_files"]:
+        add("WARN", f"overlay stale: {len(ov['stale_files'])} watched files changed since bootstrap")
+    else:
+        add("PASS", "overlay present and fresh")
+    if base:
+        changed = [f for f in L.git_out(root, ["diff", "--name-only", f"{base}...HEAD"]).splitlines()
+                   if L.any_match(pol.get("protected_paths", []), f)]
+        add("WARN" if changed else "PASS", "FRAMEWORK/PROTECTED files changed in this change — require CODEOWNERS review: " + ", ".join(changed[:8]) if changed else "no protected files changed vs " + base)
+    return out
+
+
+def cmd_ci(a):
+    root, pol = ctx()
+    res = ci_checks(root, pol, a.base, a.require_overlay)
+    for lvl, msg in res:
+        print(f"[{lvl:<4}] {msg}")
+    sys.exit(1 if any(l == "FAIL" for l, _ in res) else 0)
+
+
+def cmd_metrics(a):
+    root, pol = ctx()
+    active = need_task(root)
+    task = active["task"]
+    p = L.state_dir(root) / "audit" / f"{task}.jsonl"
+    ev = [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+    wd = root / L.WORK_REL / task
+    relevant = set()
+    if (wd / "WORK.md").exists():
+        relevant = section_paths(L.section(L.read_meta(wd / "WORK.md")[1], "Relevant Files"))
+    reads = [e["p"] for e in ev if e["k"] == "read"]
+    outside = sorted({r for r in reads if not r.startswith((".helm/", ".cursor/")) and not is_planned(r, relevant)})
+    cnt = lambda k: sum(1 for e in ev if e["k"] == k)
+    print(f"task {task}: reads={len(reads)} (unique {len(set(reads))}), shell={cnt('shell')} (denied {sum(1 for e in ev if e['k'] == 'shell' and not e['ok'])}), mcp={cnt('mcp')}, "
+          f"writes denied={cnt('write_denied')}, subagents={cnt('subagent')}, violations={cnt('violation')}")
+    print(f"files read that are NOT in WORK.md `Relevant Files`: {len(outside)}")
+    for r in outside[:25]:
+        print(f"  {r}")
+    c = L.load_json(L.task_dir(root, task) / "counters.json", {})
+    print(f"counters: {c}")
+
+
+def cmd_log(a):
+    root, pol = ctx()
+    active = need_task(root)
+    for r in L.load_records(root, active["task"])[-a.n:]:
+        print(f"{r['ts']}  {r['gate']:<10} {r['decision']:<8} {str(r.get('note', ''))[:80]}")
+
+
+class HelmArgumentParser(argparse.ArgumentParser):
+    def format_help(self):
+        if self.prog == "helm":
+            prog = "helm"
+            categories = [
+                ("Human Workflow Commands (Decisions & Gates)", [
+                    ("start [id]", "Start a task (interactive ID & tier selection)"),
+                    ("work [story]", "Dispatch discovery procedure and story execution"),
+                    ("continue", "Dispatch active agent role (planner, implementer)"),
+                    ("review", "Dispatch independent reviewer role"),
+                    ("approve [gate]", "Approve pending gate (auto-detects phase; displays artifact path)"),
+                    ("reject [gate]", "Reject pending gate with feedback to agent"),
+                    ("unblock", "Provide human decision for a BLOCKED agent"),
+                    ("finish", "Complete task, archive artifacts, promote human decisions"),
+                    ("abort", "Cancel active task and discard state"),
+                ]),
+                ("Inspection & Status Commands (Agent-Safe)", [
+                    ("status", "Inspect workflow phase, writable scope, and active gate status"),
+                    ("check [artifact]", "Validate artifact schemas, headings, and line budgets"),
+                    ("verify", "Run verification check suite on git diff"),
+                    ("log", "Display audit trail of human decisions"),
+                    ("metrics", "Report token, read/write, tool, and subagent metrics"),
+                    ("doctor", "Audit environment health, hook bindings, and policy integrity"),
+                ]),
+                ("Repository & Admin Commands", [
+                    ("setup", "Configure specialized agent models and reasoning effort"),
+                    ("bootstrap", "Initialize repository conventions, overlay, and verify config"),
+                    ("baseline", "Refresh Git snapshot baseline for current task"),
+                    ("integrity", "Check or refresh framework file tamper manifest"),
+                    ("skills", "Vendor, audit, and verify external agent skills"),
+                    ("ci", "Run state-free, hook-free policy checks in CI pipelines"),
+                    ("init", "Initialize HELM key and state directory"),
+                    ("version", "Print HELM framework version"),
+                ]),
+            ]
+            lines = [
+                ctext(f"HELM {L.FRAMEWORK_VERSION} — Human-Controlled AI Engineering Framework CLI\n", "bold"),
+                f"Usage: {prog} <command> [options]\n",
+                "Commands by Category:\n",
+            ]
+            for grp_title, cmds in categories:
+                lines.append(f"  {ctext(grp_title, 'bold')}:")
+                for cmd_name, cmd_desc in cmds:
+                    lines.append(f"    {ctext(f'{cmd_name:<18}', 'cyan')} {cmd_desc}")
+                lines.append("")
+            lines.append(f"Run '{prog} <command> --help' for details on a specific command.\n")
+            return "\n".join(lines)
+        return super().format_help()
+
+
+def main():
+    if len(sys.argv) <= 1:
+        show_welcome_card()
+        sys.exit(0)
+
+    # Alias: 'helm config models' -> 'helm setup'
+    if len(sys.argv) >= 3 and sys.argv[1] == "config" and sys.argv[2] == "models":
+        sys.argv = [sys.argv[0], "setup"] + sys.argv[3:]
+
+    ap = HelmArgumentParser(prog="helm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("init", help="Initialize HELM key and state directory").set_defaults(f=cmd_init)
+
+    s = sp.add_parser("start", help="Start a task (interactive ID & tier selection)")
+    s.add_argument("id", nargs="?", default=None, help="Task / Jira ID (e.g. FEAT-101)")
+    s.add_argument("--tier", type=int, choices=[1, 2], default=None, help="Workflow tier (1: Quick, 2: Standard)")
+    s.add_argument("--allow-dirty", action="store_true", help="Allow starting with uncommitted changes")
+    s.add_argument("--story", default=None, help="Story or requirements description")
+    s.set_defaults(f=cmd_start)
+
+    s = sp.add_parser("work", help="Dispatch discovery procedure / start task work")
+    s.add_argument("story", nargs="?", default=None, help="Story or requirements description")
+    s.add_argument("--story", dest="story_flag", default=None, help="Story or requirements description")
+    s.set_defaults(f=cmd_work)
+
+    s = sp.add_parser("continue", help="Dispatch active agent role in workflow")
+    s.set_defaults(f=cmd_continue)
+
+    s = sp.add_parser("review", help="Dispatch independent reviewer role")
+    s.set_defaults(f=cmd_review)
+
+    s = sp.add_parser("status", help="Inspect workflow phase and write scope")
+    s.add_argument("--json", action="store_true", help="Output status in JSON")
+    s.add_argument("--brief", action="store_true", help="Output brief 1-line status")
+    s.set_defaults(f=cmd_status)
+
+    s = sp.add_parser("check", help="Validate artifact schemas and constraints")
+    s.add_argument("artifact", nargs="?", help="Specific artifact to validate (WORK, PLAN, etc.) or 'all'")
+    s.set_defaults(f=cmd_check)
+
+    s = sp.add_parser("verify", help="Run verification check suite on git diff")
+    s.add_argument("--only", help="Comma-separated check names to run")
+    s.set_defaults(f=cmd_verify)
+
+    s = sp.add_parser("approve", help="Approve pending gate (auto-detects phase)")
+    s.add_argument("gate", choices=list(GATE_PHASE), nargs="?", default=None, help="Gate to approve (discovery, plan, final)")
+    s.add_argument("--override", action="store_true", help="Approve despite CHANGES_REQUIRED review verdict")
+    s.set_defaults(f=cmd_approve)
+
+    s = sp.add_parser("reject", help="Reject pending gate with feedback to agent")
+    s.add_argument("gate", choices=list(GATE_PHASE), nargs="?", default=None, help="Gate to reject (discovery, plan, final)")
+    s.add_argument("-m", "--message", default=None, help="Rejection feedback message")
+    s.set_defaults(f=cmd_reject)
+
+    s = sp.add_parser("unblock", help="Provide human decision for a BLOCKED agent")
+    s.add_argument("-m", "--message", default=None, help="Unblock decision instruction")
+    s.set_defaults(f=cmd_unblock)
+
+    s = sp.add_parser("setup", help="Configure specialized agent models")
+    s.set_defaults(f=cmd_setup)
+
+    s_cfg = sp.add_parser("config", help="Manage HELM configurations")
+    cfg_sp = s_cfg.add_subparsers(dest="config_sub")
+    cfg_models = cfg_sp.add_parser("models", help="Configure agent models")
+    cfg_models.set_defaults(f=cmd_setup)
+    s_cfg.set_defaults(f=lambda a: s_cfg.print_help() if not getattr(a, "config_sub", None) else None)
+
+    s = sp.add_parser("violations", help="Inspect or acknowledge guard violations")
+    s.add_argument("--ack", action="store_true", help="Acknowledge violation")
+    s.add_argument("-m", "--message", help="Acknowledgment message")
+    s.set_defaults(f=cmd_violations)
+
+    s = sp.add_parser("abort", help="Cancel active task and discard state")
+    s.add_argument("-m", "--message", help="Abort reason")
+    s.set_defaults(f=cmd_abort)
+
+    s = sp.add_parser("finish", help="Complete task and promote human decisions")
+    s.add_argument("--clean", action="store_true", help="Remove task work directory")
+    s.set_defaults(f=cmd_finish)
+
+    s = sp.add_parser("baseline", help="Refresh Git snapshot baseline")
+    s.add_argument("action", choices=["refresh"])
+    s.set_defaults(f=cmd_baseline)
+
+    s = sp.add_parser("integrity", help="Check or refresh framework file tamper manifest")
+    s.add_argument("action", choices=["check", "refresh"])
+    s.set_defaults(f=cmd_integrity)
+
+    s = sp.add_parser("bootstrap", help="Build repo-specific overlay and verify config")
+    s.add_argument("action", choices=["start", "accept", "abort"])
+    s.set_defaults(f=cmd_bootstrap)
+
+    s = sp.add_parser("skills", help="Vendor, audit, and verify external skills")
+    s.add_argument("action", choices=["add", "verify", "list"])
+    s.add_argument("src", nargs="?")
+    s.add_argument("--name")
+    s.add_argument("--source")
+    s.add_argument("--sha")
+    s.add_argument("--license")
+    s.add_argument("--reviewer")
+    s.add_argument("--scope")
+    s.add_argument("--allow-scripts", action="store_true")
+    s.set_defaults(f=cmd_skills)
+
+    s = sp.add_parser("doctor", help="Audit environment health and Cursor hooks")
+    s.add_argument("--live", action="store_true", help="Run live hook canary via Cursor CLI")
+    s.add_argument("--probe", action="store_true", help="Show raw audit probe entries")
+    s.set_defaults(f=cmd_doctor)
+
+    s = sp.add_parser("ci", help="Run state-free checks in CI")
+    s.add_argument("--base", help="Base commit/branch to compare against")
+    s.add_argument("--require-overlay", action="store_true", help="Require repo overlay to be present")
+    s.set_defaults(f=cmd_ci)
+
+    sp.add_parser("metrics", help="Show task activity metrics and outside reads").set_defaults(f=cmd_metrics)
+
+    s = sp.add_parser("log", help="Show decision audit log")
+    s.add_argument("-n", type=int, default=20, help="Number of records to show")
+    s.set_defaults(f=cmd_log)
+
+    sp.add_parser("version", help="Print framework version").set_defaults(f=lambda a: print(L.FRAMEWORK_VERSION))
+
+    a = ap.parse_args()
+    if a.cmd == "skills" and a.action == "add" and not all([a.src, a.name, a.source, a.sha, a.license, a.reviewer]):
+        die("skills add needs: <src_dir> --name --source --sha --license --reviewer")
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

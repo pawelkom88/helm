@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "name": "lint",      "cmd": "pnpm -w lint",      "required": true,  "timeout_s": 600 },
+    { "name": "typecheck", "cmd": "pnpm -w typecheck", "required": true,  "timeout_s": 900 },
+    { "name": "unit",      "cmd": "pnpm -w test --run","required": true,  "timeout_s": 900 },
+    { "name": "build",     "cmd": "pnpm -w build",     "required": false, "timeout_s": 1200 }
+  ]
+}

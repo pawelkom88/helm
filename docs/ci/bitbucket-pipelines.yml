@@ -1,0 +1,15 @@
+# bitbucket-pipelines.yml (merge into your existing file). Full clone is needed for the --base diff.
+clone:
+  depth: full
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: HELM framework integrity + project verification
+          image: python:3.12
+          script:
+            - git fetch origin "$BITBUCKET_PR_DESTINATION_BRANCH"
+            - python3 .helm/bin/helm ci --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH" --require-overlay
+            # Your project's authoritative gates (use the Node image/steps you already have), e.g.:
+            # - pnpm install --frozen-lockfile && pnpm -w lint && pnpm -w typecheck && pnpm -w test --run
+# Branch permissions: require this pipeline to pass, require approvals, and restrict who may merge / push to the main branch.

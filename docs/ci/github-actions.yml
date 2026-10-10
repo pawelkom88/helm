@@ -1,0 +1,20 @@
+# .github/workflows/helm.yml — CI is the control that does NOT depend on Cursor's hooks.
+# Pin third-party actions to commit SHAs per your supply-chain policy (tags shown for readability).
+name: helm
+on: [pull_request]
+permissions:
+  contents: read
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }          # needed for the --base diff
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # Framework integrity: hooks failClosed, constitution present, skills approved+unmodified,
+      # read-only MCP regex, no task artifacts committed, guard policy self-test.
+      - run: python3 .helm/bin/helm ci --base "origin/${{ github.base_ref }}" --require-overlay
+      # Your project's authoritative gates. Either call them directly, or reuse the accepted list:
+      - run: python3 .helm/bin/helm verify          # runs .helm/repo/verify.json (no state needed in CI)
+      # Then: branch protection must REQUIRE this job + code-owner review (CODEOWNERS covers /.cursor/ /.helm/ /AGENTS.md).

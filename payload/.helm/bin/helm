@@ -248,6 +248,12 @@ def require_tty():
     os.close(_open_tty())
 
 
+def handle_interrupt():
+    sys.stderr.write(ctext("\n\n✖ Cancelled by user.\n", "yellow"))
+    sys.stderr.flush()
+    sys.exit(130)
+
+
 def ask_tty(prompt):
     """Prompt on the controlling terminal (not stdin/stdout, which an agent could redirect)."""
     fd = _open_tty()
@@ -259,6 +265,8 @@ def ask_tty(prompt):
             if not ch:
                 break
             buf += ch
+    except (KeyboardInterrupt, EOFError):
+        handle_interrupt()
     finally:
         os.close(fd)
     return buf.decode(errors="replace").strip()
@@ -306,9 +314,12 @@ def prompt_user(prompt_str):
     if is_interactive() and _has_tty():
         return ask_tty(prompt_str)
     if is_interactive():
-        sys.stdout.write(prompt_str)
-        sys.stdout.flush()
-        return sys.stdin.readline().strip()
+        try:
+            sys.stdout.write(prompt_str)
+            sys.stdout.flush()
+            return sys.stdin.readline().strip()
+        except (KeyboardInterrupt, EOFError):
+            handle_interrupt()
     return ""
 
 
@@ -2509,4 +2520,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        handle_interrupt()

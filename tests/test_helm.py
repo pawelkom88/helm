@@ -756,6 +756,12 @@ class TestInteractiveCLI(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("working tree is not clean", out)
 
+    def test_keyboard_interrupt_exits_cleanly(self):
+        code, out = self.tty_run("start", lines=["\x03"])
+        self.assertEqual(code, 130)
+        self.assertIn("Cancelled by user", out)
+        self.assertNotIn("Traceback", out)
+
     def test_interactive_approve_auto_detects_phase(self):
         wd = self.start("APPR-AUTO-1", tier=1)
         self.put(f"{wd}/WORK.md", self.art("WORK", tier=1))

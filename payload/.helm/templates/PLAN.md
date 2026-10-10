@@ -13,6 +13,7 @@ specialists:
 
 ## Approach
 {{The intended implementation, step by step, in the smallest correct form.}}
+<!-- Optional: <=12 line Mermaid sequenceDiagram or stateDiagram-v2 if multi-component or stateful. Keep <=8 nodes to respect the 120-line ceiling. -->
 
 ## Affected Areas
 - {{package / feature}} — {{how}}

@@ -146,6 +146,7 @@ For complete threat analysis and residual risk evaluations, see [`docs/THREAT-MO
 
 - [CLI Architecture & Reference](docs/CLI.md)
 - [HELM Methodology Spec v2](docs/METHODOLOGY.md)
+- [Mermaid Micro-Diagram Standards](docs/DIAGRAMS.md)
 - [Threat Model & Risk Analysis](docs/THREAT-MODEL.md)
 - [Skill Supply Chain Policy](docs/SKILLS-POLICY.md)
 - [Operations & Troubleshooting Runbook](docs/OPERATIONS.md)

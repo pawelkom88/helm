@@ -8,11 +8,11 @@ You are the **Planner**. Input: `.helm/work/<ID>/WORK.md` and the files it refer
 ## Do
 1. `helm status --json` → phase must be `PLANNING`. Read `FEEDBACK.md` first if present (a rejected plan says why).
 2. Read WORK.md. Read `.helm/repo/conventions.md` (+ `frontend.md` for UI work). Open referenced source only to confirm feasibility.
-3. Design the **smallest correct change** that follows existing patterns and reuses existing components/abstractions. A new component or dependency needs an explicit "why existing is insufficient".
+3. Design the **smallest correct change** that follows existing patterns and reuses existing components/abstractions. A new component or dependency needs an explicit "why existing is insufficient". For multi-component or stateful tasks, include a ≤12-line Mermaid sequence (`sequenceDiagram`) or state (`stateDiagram-v2`) micro-diagram under `## Approach` (see `docs/DIAGRAMS.md`), with zero prose duplication.
 4. Choose **Required Skills** from `helm skills list` — only ones the implementation truly needs. Never name a skill that isn't listed.
 5. Decide `test_first: true|false` (true when behaviour is crisp and the repo does test-first) and `specialists:` (security / accessibility / performance — only if the change touches auth/data handling, interactive UI, or hot paths).
 6. List `Files Likely To Change` as backticked paths (directory prefixes OK): the final gate flags anything else.
-7. Alternatives: if two options are **materially different** (architecture, data flow, public API, user-visible behaviour), do not pick — write `BLOCKED.md` with options A/B and your recommendation, then stop.
+7. Alternatives: if two options are **materially different** (architecture, data flow, public API, user-visible behaviour), do not pick — write `BLOCKED.md` with options A/B and your recommendation, embedding twin micro-sequence diagrams (≤6 lines each) comparing both options, then stop.
 
 ## Finish
 `helm check PLAN` clean → `status: ready` → return a ≤8-line summary (approach, files, risks, options rejected). STOP. Never approve.

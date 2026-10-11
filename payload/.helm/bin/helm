@@ -262,13 +262,22 @@ def perform_repo_install(root: Path):
     else:
         payload_dir = bp
 
-    platforms = prompt_platform(root) if is_interactive() else (
-        ["antigravity"] if (root / ".agents").exists() else (
-            ["claude"] if (root / ".claude").exists() else (
-                ["codex"] if (root / ".codex").exists() else ["cursor"]
-            )
-        )
-    )
+    has_ag = (root / ".agents").exists()
+    has_cl = (root / ".claude").exists()
+    has_cx = (root / ".codex").exists()
+    has_cu = (root / ".cursor").exists()
+    detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu)] if has]
+
+    cfg_p = root / ".helm/config.json"
+    platforms = L.load_json(cfg_p, {}).get("platforms") if cfg_p.exists() else None
+
+    if not platforms:
+        if len(detected) == 1:
+            platforms = detected
+        elif is_interactive():
+            platforms = prompt_platform(root)
+        else:
+            platforms = detected or ["cursor"]
 
     print(ctext(f"\nInitializing HELM into {root.name} for {', '.join(platforms)}...", "bold"))
     for src in sorted(p for p in payload_dir.rglob("*") if p.is_file()):
@@ -305,27 +314,53 @@ def perform_repo_install(root: Path):
                     shutil.copy2(sf, df)
         (root / ".cursor/skills").mkdir(parents=True, exist_ok=True)
         print(ctext("  ✔ Configured Cursor hooks and MCP template", "green"))
+        print(ctext("  ✔ Initialized .cursor/mcp.json (Atlassian MCP configuration template)", "green"))
+        print(ctext("  • Atlassian MCP in .cursor/mcp.json requires credentials (JIRA_URL, JIRA_API_TOKEN) to fetch Jira tickets", "dim"))
 
     if "antigravity" in platforms:
         src = payload_dir / ".agents/hooks.json"
         if src.exists():
             merge_antigravity_hooks(root / ".agents/hooks.json", src)
         (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
-        print(ctext("  ✔ Configured Google Antigravity fail-closed hooks", "green"))
+        src_agents = payload_dir / ".agents" if (payload_dir / ".agents").exists() else payload_dir / ".cursor/agents"
+        for af in src_agents.glob("*.md"):
+            df = root / ".agents" / af.name
+            df.parent.mkdir(parents=True, exist_ok=True)
+            if not df.exists():
+                shutil.copy2(af, df)
+        ag_helm = root / ".agents/.helm"
+        if not ag_helm.exists() and not ag_helm.is_symlink():
+            try:
+                ag_helm.symlink_to("../.helm")
+            except Exception:
+                pass
+        print(ctext("  ✔ Configured Google Antigravity fail-closed hooks and role definitions", "green"))
 
     if "claude" in platforms:
         src = payload_dir / ".claude/settings.json"
         if src.exists():
             merge_claude_settings(root / ".claude/settings.json", src)
         (root / ".claude/skills").mkdir(parents=True, exist_ok=True)
-        print(ctext("  ✔ Configured Anthropic Claude Code hooks", "green"))
+        src_agents = payload_dir / ".claude/agents" if (payload_dir / ".claude/agents").exists() else payload_dir / ".cursor/agents"
+        for af in src_agents.glob("*.md"):
+            df = root / ".claude/agents" / af.name
+            df.parent.mkdir(parents=True, exist_ok=True)
+            if not df.exists():
+                shutil.copy2(af, df)
+        print(ctext("  ✔ Configured Anthropic Claude Code hooks and role definitions", "green"))
 
     if "codex" in platforms:
         src = payload_dir / ".codex/hooks.json"
         if src.exists():
             merge_codex_hooks(root / ".codex/hooks.json", src)
         (root / ".codex/skills").mkdir(parents=True, exist_ok=True)
-        print(ctext("  ✔ Configured OpenAI Codex hooks", "green"))
+        src_agents = payload_dir / ".codex/agents" if (payload_dir / ".codex/agents").exists() else payload_dir / ".cursor/agents"
+        for af in src_agents.glob("*.md"):
+            df = root / ".codex/agents" / af.name
+            df.parent.mkdir(parents=True, exist_ok=True)
+            if not df.exists():
+                shutil.copy2(af, df)
+        print(ctext("  ✔ Configured OpenAI Codex hooks and role definitions", "green"))
 
     for f in ("helm", "helm_guard.py", "helm_lib.py"):
         p = root / ".helm/bin" / f
@@ -1734,10 +1769,31 @@ def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: 
     return "\n".join(lines)
 
 
+def get_agent_role_path(root: Path, role_name: str) -> Path:
+    cfg = L.load_json(root / ".helm/config.json", {})
+    platforms = cfg.get("platforms", [])
+    if "antigravity" in platforms and (root / f".agents/{role_name}.md").exists():
+        return root / f".agents/{role_name}.md"
+    if "claude" in platforms and (root / f".claude/agents/{role_name}.md").exists():
+        return root / f".claude/agents/{role_name}.md"
+    if "codex" in platforms and (root / f".codex/agents/{role_name}.md").exists():
+        return root / f".codex/agents/{role_name}.md"
+    if (root / f".cursor/agents/{role_name}.md").exists():
+        return root / f".cursor/agents/{role_name}.md"
+    if "antigravity" in platforms:
+        return root / f".agents/{role_name}.md"
+    if "claude" in platforms:
+        return root / f".claude/agents/{role_name}.md"
+    if "codex" in platforms:
+        return root / f".codex/agents/{role_name}.md"
+    return root / f".cursor/agents/{role_name}.md"
+
+
 def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: str, context_notes: str = "", story_file: Path | None = None, pol: dict | None = None, manual: bool = False):
     """Dispatch an AI agent role, running HELM_CLI_CMD if configured, or formatting the exact prompt."""
     wd_rel = f"{L.WORK_REL}/{task_id}"
-    spec_rel = f".cursor/agents/{role_name}.md" if (root / f".cursor/agents/{role_name}.md").exists() else "AGENTS.md"
+    agent_target = get_agent_role_path(root, role_name)
+    spec_rel = str(agent_target.relative_to(root)) if agent_target.exists() else "AGENTS.md"
 
     def _show_status():
         try:
@@ -2110,21 +2166,36 @@ def cmd_unblock(a):
 def cmd_setup(a):
     root, pol = ctx()
     models, mpath = load_models(root)
-    print(ctext("\n=== HELM Agent Model Configuration ===", "bold"))
-    print(ctext("Configure specialized models for architecture planning and independent review.\n", "dim"))
+    cfg_path = root / ".helm/config.json"
+    cfg = L.load_json(cfg_path, {})
+    platforms = cfg.get("platforms", [])
 
-    for role, rel_path in [("Planner", ".cursor/agents/planner.md"), ("Reviewer", ".cursor/agents/reviewer.md")]:
-        target = root / rel_path
-        if not target.exists():
-            payload_target = root / "payload" / rel_path
-            if payload_target.exists():
-                target = payload_target
+    if "antigravity" in platforms:
+        platform_label = "Google Antigravity"
+    elif "claude" in platforms:
+        platform_label = "Anthropic Claude Code"
+    elif "codex" in platforms:
+        platform_label = "OpenAI Codex"
+    elif "cursor" in platforms:
+        platform_label = "Cursor"
+    else:
+        platform_label = "your AI platform"
+
+    print(ctext("\n=== HELM Agent Model Configuration ===", "bold"))
+    print(ctext(f"Configure specialized models for {platform_label}.\n", "dim"))
+
+    for role, role_key in [("Planner", "planner"), ("Reviewer", "reviewer")]:
+        target = get_agent_role_path(root, role_key)
+        rel_display = str(target.relative_to(root)) if target.exists() else f"{role_key}.md"
         cur_model = "inherit"
         if target.exists():
             meta, _ = L.read_meta(target)
             cur_model = meta.get("model", "inherit")
+        elif role_key in cfg.get("models", {}):
+            m_val = cfg["models"][role_key]
+            cur_model = m_val.get("id", m_val) if isinstance(m_val, dict) else m_val
 
-        print(ctext(f"\nSelect model for {role} ({rel_path}):", "bold"))
+        print(ctext(f"\nSelect model for {role} ({rel_display}):", "bold"))
         print(f"Current setting: {ctext(cur_model, 'cyan')}")
         for idx, m in enumerate(models, 1):
             default_tag = " [Default]" if m["id"] == "inherit" else ""
@@ -2144,7 +2215,7 @@ def cmd_setup(a):
                 is_reasoning = models[choice_num - 1].get("reasoning", False)
             elif choice_num == len(models) + 1:
                 while True:
-                    custom = prompt_user("Enter model identifier as configured in Cursor: ").strip()
+                    custom = prompt_user(f"Enter model identifier as configured in {platform_label}: ").strip()
                     if not re.match(r"^[A-Za-z0-9._-]+$", custom):
                         print(ctext("Invalid model identifier (use letters, numbers, '.', '_', '-')", "red"))
                         continue
@@ -2168,13 +2239,24 @@ def cmd_setup(a):
             efforts = {"1": "medium", "2": "high", "3": "low"}
             reasoning_effort = efforts.get(e_sel, "medium")
 
-        updated_any = False
-        for p in [root / rel_path, root / "payload" / rel_path]:
+        cands = [
+            root / f".agents/{role_key}.md",
+            root / f".claude/agents/{role_key}.md",
+            root / f".codex/agents/{role_key}.md",
+            root / f".cursor/agents/{role_key}.md",
+            root / f"payload/.agents/{role_key}.md",
+            root / f"payload/.claude/agents/{role_key}.md",
+            root / f"payload/.codex/agents/{role_key}.md",
+            root / f"payload/.cursor/agents/{role_key}.md",
+        ]
+        for p in cands:
             if p.exists():
                 update_agent_model(p, chosen_id, reasoning_effort)
-                updated_any = True
                 print(ctext(f"  ✔ Updated {p.relative_to(root)} -> model: {chosen_id}" + (f", effort: {reasoning_effort}" if reasoning_effort else ""), "green"))
 
+        cfg.setdefault("models", {})[role_key] = {"id": chosen_id, "effort": reasoning_effort} if reasoning_effort else chosen_id
+
+    L.dump_json(cfg_path, cfg)
     L.ensure_key()
     L.integrity_refresh(root, pol)
     print(ctext("\n✔ Integrity manifest refreshed (helm integrity refresh)", "green"))

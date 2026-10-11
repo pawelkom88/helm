@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .helm/bin/helm_guard.py tool --platform antigravity",
+            "command": "python3 -c \"import sys,os; p='.helm/bin/helm_guard.py' if os.path.exists('.helm/bin/helm_guard.py') else ('../.helm/bin/helm_guard.py' if os.path.exists('../.helm/bin/helm_guard.py') else '.helm/bin/helm_guard.py'); os.execv(sys.executable, [sys.executable, p] + sys.argv[1:])\" tool --platform antigravity",
             "timeout": 30
           }
         ]

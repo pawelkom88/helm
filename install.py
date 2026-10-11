@@ -370,6 +370,13 @@ def main():
         dst.parent.mkdir(parents=True, exist_ok=True)
         if rel == ".agents/hooks.json":
             merge_antigravity_hooks(dst, src)
+            ag_helm = repo / ".agents/.helm"
+            if not ag_helm.exists() and not ag_helm.is_symlink():
+                try:
+                    ag_helm.symlink_to("../.helm")
+                    say("linked .agents/.helm -> ../.helm")
+                except Exception:
+                    pass
             say("configured .agents/hooks.json (Antigravity fail-closed hooks)")
         elif rel == ".claude/settings.json":
             merge_claude_settings(dst, src)

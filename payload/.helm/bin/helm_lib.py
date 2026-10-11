@@ -213,7 +213,7 @@ def glob_re(pat: str):
         else:
             out += re.escape(c)
         i += 1
-    return re.compile("^" + out + "$")
+    return re.compile("^" + out + "$", re.IGNORECASE)
 
 
 _RE: dict = {}
@@ -250,13 +250,16 @@ def static_prefix(g: str) -> str:
     return g[:m.start()] if m else g
 
 
+ALLOWED_VIRTUAL_DEVICES = {"/dev/null", "/dev/stdout", "/dev/stderr"}
+
+
 def is_tmp(q: Path) -> bool:
     s = q.as_posix()
     tmp = (os.environ.get("TMPDIR") or "/tmp").rstrip("/")
     resolved_tmp = Path(tmp).resolve().as_posix().rstrip("/")
     resolved_slash_tmp = Path("/tmp").resolve().as_posix().rstrip("/")
     return (s.startswith("/tmp/") or s.startswith("/private/tmp/") or
-            s.startswith("/dev/") or
+            s in ALLOWED_VIRTUAL_DEVICES or s in {"/dev/fd/1", "/dev/fd/2"} or
             (bool(tmp) and s.startswith(tmp + "/")) or
             (bool(resolved_tmp) and s.startswith(resolved_tmp + "/")) or
             (bool(resolved_slash_tmp) and s.startswith(resolved_slash_tmp + "/")))

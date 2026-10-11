@@ -371,6 +371,11 @@ def main():
         if rel == ".agents/hooks.json":
             merge_antigravity_hooks(dst, src)
             ag_helm = repo / ".agents/.helm"
+            if ag_helm.is_symlink() and not ag_helm.exists():
+                try:
+                    ag_helm.unlink()
+                except Exception:
+                    pass
             if not ag_helm.exists() and not ag_helm.is_symlink():
                 try:
                     ag_helm.symlink_to("../.helm")

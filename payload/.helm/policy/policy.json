@@ -51,7 +51,13 @@
     "~/.docker/config.json",
     "~/.git-credentials",
     "~/.cursor/mcp.json",
-    "**/.cursor/mcp.json"
+    "**/.cursor/mcp.json",
+    "**/.claude/settings.json",
+    "~/.claude/**",
+    "**/.agents/**mcp*.json",
+    "~/.agents/**",
+    "**/.codex/**config*.json",
+    "~/.codex/**"
   ],
   "secret_allow_globs": [
     "**/.env.example",
@@ -106,7 +112,7 @@
     "max_calls_per_task": 60
   },
   "web": {
-    "allow_search": false,
+    "allow_search": true,
     "fetch_domains": [
       "react.dev",
       "tanstack.com",

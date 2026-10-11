@@ -143,6 +143,62 @@ def merge_antigravity_hooks(dst: Path, src: Path):
     dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
 
 
+def ensure_antigravity_env(root: Path):
+    """Ensure Antigravity environment has valid symlinks, resilient hooks, and role specs."""
+    ag_dir = root / ".agents"
+    if not ag_dir.exists():
+        return
+    ag_helm = ag_dir / ".helm"
+    if ag_helm.is_symlink() and not ag_helm.exists():
+        try:
+            ag_helm.unlink()
+        except Exception:
+            pass
+    if not ag_helm.exists() and not ag_helm.is_symlink():
+        try:
+            ag_helm.symlink_to("../.helm")
+        except Exception:
+            pass
+
+    hooks_file = ag_dir / "hooks.json"
+    resilient_cmd = (
+        'python3 -c "import sys,os; '
+        "p='.helm/bin/helm_guard.py' if os.path.exists('.helm/bin/helm_guard.py') else "
+        "('../.helm/bin/helm_guard.py' if os.path.exists('../.helm/bin/helm_guard.py') else '.helm/bin/helm_guard.py'); "
+        'os.execv(sys.executable, [sys.executable, p] + sys.argv[1:])" tool --platform antigravity'
+    )
+    if hooks_file.exists():
+        try:
+            hk = L.load_json(hooks_file, {})
+            changed = False
+            for entry in hk.get("helm-guard", {}).get("PreToolUse", []):
+                for h in entry.get("hooks", []):
+                    c = h.get("command", "")
+                    if "helm_guard.py" in c and "import sys,os" not in c:
+                        h["command"] = resilient_cmd
+                        changed = True
+            if changed:
+                L.dump_json(hooks_file, hk)
+        except Exception:
+            pass
+    else:
+        bp = find_blueprint()
+        src_hooks = bp / ".agents/hooks.json" if bp else None
+        if src_hooks and src_hooks.exists():
+            merge_antigravity_hooks(hooks_file, src_hooks)
+
+    bp = find_blueprint()
+    src_agents = (bp / ".agents") if (bp and (bp / ".agents").exists()) else (root / ".cursor/agents")
+    if src_agents and src_agents.exists():
+        for af in src_agents.glob("*.md"):
+            df = ag_dir / af.name
+            if not df.exists():
+                try:
+                    shutil.copy2(af, df)
+                except Exception:
+                    pass
+
+
 def merge_claude_settings(dst: Path, src: Path):
     ours = json.loads(src.read_text(encoding="utf-8"))
     cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
@@ -322,18 +378,7 @@ def perform_repo_install(root: Path):
         if src.exists():
             merge_antigravity_hooks(root / ".agents/hooks.json", src)
         (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
-        src_agents = payload_dir / ".agents" if (payload_dir / ".agents").exists() else payload_dir / ".cursor/agents"
-        for af in src_agents.glob("*.md"):
-            df = root / ".agents" / af.name
-            df.parent.mkdir(parents=True, exist_ok=True)
-            if not df.exists():
-                shutil.copy2(af, df)
-        ag_helm = root / ".agents/.helm"
-        if not ag_helm.exists() and not ag_helm.is_symlink():
-            try:
-                ag_helm.symlink_to("../.helm")
-            except Exception:
-                pass
+        ensure_antigravity_env(root)
         print(ctext("  ✔ Configured Google Antigravity fail-closed hooks and role definitions", "green"))
 
     if "claude" in platforms:
@@ -1798,6 +1843,11 @@ def get_agent_role_path(root: Path, role_name: str) -> Path:
 
 def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: str, context_notes: str = "", story_file: Path | None = None, pol: dict | None = None, manual: bool = False):
     """Dispatch an AI agent role, running HELM_CLI_CMD if configured, or formatting the exact prompt."""
+    cfg = L.load_json(root / ".helm/config.json", {})
+    platforms = cfg.get("platforms", [])
+    if "antigravity" in platforms or (root / ".agents").exists():
+        ensure_antigravity_env(root)
+
     wd_rel = f"{L.WORK_REL}/{task_id}"
     agent_target = get_agent_role_path(root, role_name)
     spec_rel = str(agent_target.relative_to(root)) if agent_target.exists() else "AGENTS.md"
@@ -2664,9 +2714,32 @@ def doctor_checks(root, pol):
             any("helm_guard.py" in h.get("command", "") for h in entry.get("hooks", []))
             for entry in pre_tool
         )
-        add("PASS" if wired else "FAIL", ".agents/hooks.json: Antigravity PreToolUse guard wired" if wired else ".agents/hooks.json: missing helm_guard.py PreToolUse hook")
+        ag_link = root / ".agents/.helm"
+        link_broken = ag_link.is_symlink() and not ag_link.exists()
+        link_ok = ag_link.exists()
+        has_fallback = any(
+            any("import sys,os" in h.get("command", "") or "../.helm" in h.get("command", "") for h in entry.get("hooks", []))
+            for entry in pre_tool
+        )
+        resolves = link_ok or has_fallback
+        if not wired:
+            add("FAIL", ".agents/hooks.json: missing helm_guard.py PreToolUse hook")
+        elif link_broken:
+            add("FAIL", ".agents/.helm: broken symlink (recreate via `ln -sf ../.helm .agents/.helm`)")
+        elif not resolves:
+            add("FAIL", ".agents/hooks.json: guard cannot resolve from .agents/ (missing .agents/.helm symlink or fallback command)")
+        else:
+            add("PASS", ".agents/hooks.json: Antigravity PreToolUse guard wired and resolvable")
+
         has_bin = any(shutil.which(b) for b in ("agy", "antigravity", "gemini"))
         add("PASS" if has_bin else "WARN", "Antigravity CLI binary found on PATH" if has_bin else "No Antigravity CLI binary found (install agy for CLI runner)")
+
+        roles = ["discovery", "planner", "reviewer", "test-analyst"]
+        missing_roles = [r for r in roles if not (root / f".agents/{r}.md").exists()]
+        if missing_roles:
+            add("WARN", f".agents/: missing role definitions for {', '.join(missing_roles)} (run `helm init` to sync)")
+        else:
+            add("PASS", ".agents/: role definitions present")
 
     if "claude" in platforms:
         cl_cfg = L.load_json(root / ".claude/settings.json", {})

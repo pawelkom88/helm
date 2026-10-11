@@ -1181,6 +1181,8 @@ class TestMultiPlatform(Base):
         sh(sys.executable, str(BUNDLE / "install.py"), str(new_repo), "--platform", "antigravity", cwd=new_repo, env=self.env)
         self.assertTrue((new_repo / ".agents/hooks.json").exists())
         self.assertTrue((new_repo / ".agents/skills").exists())
+        self.assertTrue((new_repo / ".agents/.helm").exists())
+        self.assertTrue((new_repo / ".agents/discovery.md").exists())
         self.assertFalse((new_repo / ".cursor/hooks.json").exists())
         cfg = json.loads((new_repo / ".helm/config.json").read_text())
         self.assertEqual(cfg.get("platforms"), ["antigravity"])
@@ -1188,6 +1190,30 @@ class TestMultiPlatform(Base):
         self.assertIn(".agents/", gi_content)
         self.assertIn(".helm/", gi_content)
         self.assertIn("AGENTS.md", gi_content)
+
+        # Verify hook command executes from .agents cwd
+        hooks_data = json.loads((new_repo / ".agents/hooks.json").read_text())
+        cmd_str = hooks_data["helm-guard"]["PreToolUse"][0]["hooks"][0]["command"]
+        test_input = json.dumps({"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}, "workspacePaths": [str(new_repo)]})
+        r = subprocess.run(cmd_str, shell=True, input=test_input, text=True, capture_output=True, cwd=new_repo / ".agents", env=self.env)
+        self.assertEqual(r.returncode, 0)
+        res = json.loads(r.stdout)
+        self.assertEqual(res.get("decision"), "allow")
+
+        # Test broken symlink self-healing
+        (new_repo / ".agents/.helm").unlink()
+        (new_repo / ".agents/.helm").symlink_to("../nonexistent_target")
+        self.assertTrue((new_repo / ".agents/.helm").is_symlink())
+        self.assertFalse((new_repo / ".agents/.helm").exists())
+
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("helm_cli_test", str(BUNDLE / "payload/.helm/bin/helm"))
+        spec = importlib.util.spec_from_loader("helm_cli_test", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        mod.ensure_antigravity_env(new_repo)
+        self.assertTrue((new_repo / ".agents/.helm").exists())
 
     def test_antigravity_guard_pretooluse(self):
         # 1. Deny git commit
@@ -1250,6 +1276,89 @@ class TestMultiPlatform(Base):
             # Diagnostic format
             diag = helm_cli.format_runner_diagnostics(["agy", "-p"], 1, ["unauthorized: authentication required"], "discovery", "PROJ-1")
             self.assertIn("agy auth login", diag)
+
+    def test_case_insensitive_glob_re(self):
+        # SEC-01: glob_re is case-insensitive
+        pol = L.load_policy(self.repo)
+        self.assertTrue(L.gmatch("**/.env", ".ENV"))
+        self.assertTrue(L.gmatch("**/.env", ".Env"))
+        self.assertTrue(L.gmatch("AGENTS.md", "AGENTS.MD"))
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".ENV")["secret"])
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".Env")["secret"])
+        self.assertTrue(L.classify(self.repo, pol, self.repo / "AGENTS.MD")["protected"])
+
+    def test_allowed_virtual_devices(self):
+        # SEC-05: only explicitly allowed virtual devices are treated as tmp
+        self.assertEqual(L.ALLOWED_VIRTUAL_DEVICES, {"/dev/null", "/dev/stdout", "/dev/stderr"})
+        self.assertTrue(L.is_tmp(Path("/dev/null")))
+        self.assertTrue(L.is_tmp(Path("/dev/stdout")))
+        self.assertTrue(L.is_tmp(Path("/dev/stderr")))
+        self.assertFalse(L.is_tmp(Path("/dev/zero")))
+        self.assertFalse(L.is_tmp(Path("/dev/random")))
+        self.assertFalse(L.is_tmp(Path("/dev/sda")))
+        self.assertFalse(L.is_tmp(Path("/dev/disk0")))
+
+        # Redirect to /dev/null is allowed, redirect to /dev/zero or /dev/sda is blocked
+        out_null = self.guard("shell", {"command": "echo hello > /dev/null"})
+        self.assertEqual(out_null.get("permission"), "allow")
+        out_zero = self.guard("shell", {"command": "echo hello > /dev/zero"})
+        self.assertEqual(out_zero.get("permission"), "deny")
+
+    def test_secret_globs_platform_configs(self):
+        # Platform config and credential paths in secret_globs
+        pol = L.load_policy(self.repo)
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".claude/settings.json")["secret"])
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".agents/custom_mcp.json")["secret"])
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".codex/app_config.json")["secret"])
+
+    def test_antigravity_web_ingress_and_routing(self):
+        # SEC-02: read_url_content / fetch_url routing to WebFetch, search_web to WebSearch
+        # 1. Allowlisted url via read_url_content
+        payload_fetch_ok = {
+            "toolCall": {"name": "read_url_content", "args": {"Url": "https://react.dev/reference/react"}},
+            "workspacePaths": [str(self.repo)]
+        }
+        r = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                           input=json.dumps(payload_fetch_ok), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r.returncode, 0)
+        res = json.loads(r.stdout)
+        self.assertEqual(res.get("decision"), "allow")
+
+        # 2. Denied url via read_url_content
+        payload_fetch_deny = {
+            "toolCall": {"name": "read_url_content", "args": {"Url": "https://evil.example.com"}},
+            "workspacePaths": [str(self.repo)]
+        }
+        r2 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                            input=json.dumps(payload_fetch_deny), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r2.returncode, 0)
+        res2 = json.loads(r2.stdout)
+        self.assertEqual(res2.get("decision"), "deny")
+
+        # 3. search_web via Antigravity ingress
+        payload_search = {
+            "toolCall": {"name": "search_web", "args": {"query": "python unittest"}},
+            "workspacePaths": [str(self.repo)]
+        }
+        r3 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                            input=json.dumps(payload_search), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r3.returncode, 0)
+        res3 = json.loads(r3.stdout)
+        self.assertEqual(res3.get("decision"), "allow")
+
+        # 4. searchweb directly via h_tool
+        out_sw = self.guard("tool", {"tool_name": "search_web", "tool_input": {"query": "python"}})
+        self.assertEqual(out_sw.get("permission"), "allow")
+        out_sw2 = self.guard("tool", {"tool_name": "SearchWeb", "tool_input": {"query": "python"}})
+        self.assertEqual(out_sw2.get("permission"), "allow")
+
+    def test_read_tools_unbounded_batch_paths(self):
+        # SEC-04: Batch paths beyond 20 are inspected
+        safe_paths = [f"src/file_{i}.ts" for i in range(25)]
+        paths_with_secret = safe_paths[:22] + [".env"] + safe_paths[22:]
+        out = self.guard("tool", {"tool_name": "grep", "tool_input": {"paths": paths_with_secret}})
+        self.assertEqual(out.get("permission"), "deny")
+        self.assertIn("reading `.env` is not allowed", out.get("agent_message", ""))
 
 
 if __name__ == "__main__":

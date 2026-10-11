@@ -455,7 +455,7 @@ def _find_url(obj):
 
 def h_web(name, inp, ctx):
     w = ctx.pol.get("web", {})
-    if name == "websearch":
+    if name in ("websearch", "searchweb"):
         return allow() if w.get("allow_search") else deny("built-in web search is disabled by policy")
     url = _find_url(inp)
     u = urlparse(url)
@@ -478,12 +478,12 @@ def h_tool(p, ctx):
             inp = {"raw": inp}
     if name in ("shell", "bash", "terminal", "runterminalcmd", "task") or name.startswith("mcp"):
         return allow()  # covered by dedicated hooks
-    if name in ("webfetch", "fetchurl", "websearch"):
+    if name in ("webfetch", "fetchurl", "websearch", "searchweb"):
         return h_web(name, inp, ctx)
     paths = L.extract_paths(inp)
     cwd = p.get("cwd") or ctx.cwd
     if name in READ_TOOLS:
-        for pp in paths[:20]:
+        for pp in paths:
             c = L.classify(ctx.root, ctx.pol, L.resolve(ctx.root, pp, cwd))
             if c["secret"] or c["state"]:
                 return deny(f"reading `{pp}` is not allowed (secret/state path)")
@@ -592,8 +592,13 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
             cwd = args.get("Cwd") or ws
             if name == "run_command":
                 return "antigravity", "shell", {"command": args.get("CommandLine", ""), "cwd": cwd}
-            elif name in ("view_file", "read_resource", "read_url_content"):
+            elif name in ("view_file", "read_resource"):
                 return "antigravity", "read", {"file_path": args.get("AbsolutePath") or args.get("TargetFile") or args.get("Uri"), "cwd": cwd}
+            elif name in ("read_url_content", "fetch_url"):
+                url = args.get("Url") or args.get("url") or ""
+                return "antigravity", "tool", {"tool_name": "WebFetch", "tool_input": {"url": url}, "cwd": cwd}
+            elif name in ("search_web", "web_search"):
+                return "antigravity", "tool", {"tool_name": "WebSearch", "tool_input": args, "cwd": cwd}
             elif name in ("write_to_file", "replace_file_content"):
                 target = args.get("TargetFile") or args.get("AbsolutePath")
                 return "antigravity", "tool", {"tool_name": "Write", "tool_input": {"path": target}, "cwd": cwd}
@@ -621,6 +626,13 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
         if tname in ("Edit", "Write", "apply_patch", "edit_file", "write_to_file", "MultiEdit"):
             inp = payload.get("tool_input") or payload
             return "claude_codex", "tool", {"tool_name": "Write", "tool_input": inp, "cwd": payload.get("cwd")}
+        if tname in ("read_url_content", "fetch_url"):
+            inp = payload.get("tool_input") or payload
+            url = inp.get("Url") or inp.get("url") or ""
+            return "claude_codex", "tool", {"tool_name": "WebFetch", "tool_input": {"url": url}, "cwd": payload.get("cwd")}
+        if tname in ("search_web", "web_search"):
+            inp = payload.get("tool_input") or payload
+            return "claude_codex", "tool", {"tool_name": "WebSearch", "tool_input": inp, "cwd": payload.get("cwd")}
         return "claude_codex", mode, payload
 
     # 3. Native Cursor format (default)

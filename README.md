@@ -65,14 +65,23 @@ python3 install.py --global
 
 ### 2. In ANY Repository
 
-Simply navigate to any project repository and run:
+Navigate to any project repository and run:
 
 ```bash
-helm start
-# or explicitly: python3 install.py . --platform [antigravity|claude|codex|cursor|all]
+# For Cursor (default — zero prompts, automatic .cursor/ setup):
+helm start [ID]
+
+# For Google Antigravity:
+helm start [ID] --ag
+# or: helm start [ID] --platform antigravity
+
+# For Claude Code, Codex CLI, or All Platforms:
+helm start [ID] --platform claude
+helm start [ID] --platform codex
+helm start [ID] --platform all
 ```
 
-> **Automatic Repository Initialization**: If HELM is not yet initialized in the target repository, `helm start` will automatically prompt you to select your AI coding platform (**Google Antigravity**, **Claude Code**, **Codex**, or **Cursor**) and configure the corresponding hooks and governance layer on the fly.
+> **Zero-Friction Auto-Initialization**: On a fresh repository, `helm start` defaults directly to **Cursor** with zero interactive prompts. To set up for **Google Antigravity**, **Claude Code**, or **Codex CLI**, pass `--ag` or `--platform <name>`. On already initialized repositories, `helm start` detects the active platform from `.helm/config.json` and starts work immediately.
 
 ### 3. First-Time Verification Checklist
 
@@ -88,7 +97,7 @@ helm start
 
 ## 📊 Workflow Tiers
 
-Choose the appropriate governance tier when starting a task (`helm start <ID> --tier 1|2`):
+Choose the appropriate governance tier when starting a task (`helm start [ID] --tier 1|2`):
 
 | Tier | Best For | Gates Required | Workflow Pipeline |
 | :--- | :--- | :--- | :--- |
@@ -103,13 +112,13 @@ Choose the appropriate governance tier when starting a task (`helm start <ID> --
 
 | Command | Purpose |
 | :--- | :--- |
-| `helm start <ID> [--tier 1\|2]` | Begin a new task (snapshots Git baseline and opens interactive wizard) |
+| `helm start [ID] [--tier 1\|2] [--platform ...] [--ag]` | Begin a new task (defaults to Cursor; use `--ag` for Antigravity) |
 | `helm approve [gate]` | Cryptographically sign and approve a pending gate (`discovery`, `plan`, `final`) |
 | `helm reject [gate] -m "..."` | Reject a gate and provide mandatory feedback to the agent |
 | `helm unblock -m "..."` | Provide a human resolution for an agent frozen in `BLOCKED` state |
 | `helm finish [--clean]` | Complete task, archive artifacts, and promote human decisions to `docs/decisions.md` |
 | `helm abort` | Cancel the active task and discard transient workflow state |
-| `helm reset [--clean]` | Reset all task state and clear `.helm/work/` workspace |
+| `helm reset [--clean]` | Reset task state and `.helm/work/` (`--clean` removes all generated HELM setup files from the repository) |
 | `helm setup` | Configure specialized LLM models and reasoning effort for Planner/Reviewer roles |
 
 ### Inspection & Diagnostic Commands (Agent-Safe)

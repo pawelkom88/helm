@@ -395,10 +395,12 @@ def protected_files(root, pol):
             cands = []
             for dp, dn, fn in os.walk(base):
                 dn[:] = [d for d in dn if d not in (".git", "node_modules", "work", "bootstrap", "__pycache__")]
-                cands += [Path(dp) / f for f in fn]
+                cands += [Path(dp) / f for f in fn if (Path(dp) / f).is_file()]
         else:
             continue
         for p in cands:
+            if not p.is_file():
+                continue
             rel = p.relative_to(root).as_posix()
             if gmatch(g, rel):
                 seen[rel] = None
@@ -409,7 +411,13 @@ def protected_files(root, pol):
 
 
 def integrity_manifest(root, pol) -> dict:
-    return {rel: sha256_file(Path(root) / rel) for rel in protected_files(root, pol)}
+    out = {}
+    for rel in protected_files(root, pol):
+        try:
+            out[rel] = sha256_file(Path(root) / rel)
+        except OSError:
+            pass
+    return out
 
 
 def integrity_path(root) -> Path:

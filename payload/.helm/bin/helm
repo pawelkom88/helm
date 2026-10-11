@@ -98,9 +98,16 @@ def read_blueprint_text(p: Path) -> str:
 
 
 def copy_blueprint_file(src: Path, dst: Path):
+    try:
+        if src.resolve() == dst.resolve():
+            return
+    except OSError:
+        pass
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(src, dst)
+    except shutil.SameFileError:
+        return
     except OSError:
         dst.write_bytes(read_blueprint_bytes(src))
 
@@ -205,7 +212,7 @@ def insert_block(agents: Path, block: str):
     if agents.exists():
         txt = agents.read_text(encoding="utf-8")
         if BEGIN in txt and END in txt:
-            a, b = txt.index(BEGIN), txt.index(END) + len(END)
+            a, b = txt.index(BEGIN), txt.rindex(END) + len(END)
             txt = txt[:a] + block.rstrip("\n") + txt[b:]
         else:
             txt = txt.rstrip("\n") + "\n\n" + block
@@ -270,12 +277,26 @@ def ensure_antigravity_env(root: Path):
                     break
         if src_hooks and src_hooks.exists():
             merge_antigravity_hooks(hooks_file, src_hooks)
+        else:
+            L.dump_json(
+                hooks_file,
+                {
+                    "helm-guard": {
+                        "PreToolUse": [
+                            {
+                                "matcher": "*",
+                                "hooks": [{"type": "command", "command": resilient_cmd}],
+                            }
+                        ]
+                    }
+                },
+            )
 
     bp = find_blueprint()
     src_agents = None
     if bp:
         for cand in [bp / ".agents", bp / "payload/.agents", bp.parent / ".agents", bp.parent / "payload/.agents"]:
-            if cand.exists():
+            if cand != ag_dir and cand.exists() and (list(cand.glob("*.md")) or [p for p in list_blueprint_files(cand) if p.suffix == ".md"]):
                 src_agents = cand
                 break
     if not src_agents:
@@ -435,13 +456,12 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
             platforms = detected or ["cursor"]
 
     print(ctext(f"\nInitializing HELM into {root.name} for {', '.join(platforms)}...", "bold"))
-    for src in list_blueprint_files(payload_dir):
+    helm_payload_dir = payload_dir / ".helm" if (payload_dir / ".helm").exists() else payload_dir
+    for src in list_blueprint_files(helm_payload_dir):
         rel = src.relative_to(payload_dir).as_posix()
-        if (rel == "AGENTS.helm.md" or
-            rel.startswith(".cursor/") or
-            rel.startswith(".agents/") or
-            rel.startswith(".claude/") or
-            rel.startswith(".codex/") or
+        if (not rel.startswith(".helm/") or
+            rel.startswith(".helm/work/") or
+            rel.startswith(".helm/bootstrap/") or
             "__pycache__" in rel or rel.endswith(".pyc")):
             continue
         dst = root / rel
@@ -482,8 +502,9 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
         (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
         ensure_antigravity_env(root)
         ag_mcp = root / ".agents/mcp_config.json"
-        if not ag_mcp.exists() and not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
-            merge_mcp(ag_mcp, None)
+        if not ag_mcp.exists():
+            seed_mcp = (root / ".cursor/mcp.json") if (root / ".cursor/mcp.json").exists() else None
+            merge_mcp(ag_mcp, seed_mcp)
             print(ctext("  ✔ Initialized .agents/mcp_config.json (Atlassian MCP configuration template)", "green"))
         print(ctext("  ✔ Configured Google Antigravity fail-closed hooks and role definitions", "green"))
 
@@ -727,25 +748,42 @@ def is_mcp_placeholder(val: str | None) -> bool:
 
 
 def inspect_atlassian_mcp(root, platforms=None):
-    """Inspect .cursor/mcp.json and ~/.cursor/mcp.json for Atlassian/Jira MCP config.
+    """Inspect .agents/mcp_config.json, .cursor/mcp.json, and home MCP configs for Atlassian/Jira MCP config.
     Returns (connected: bool, server_name: str|None, spec: dict|None, missing_fields: list[str], cfg_path: str).
     """
     if platforms is None and root is not None and (root / ".helm/config.json").exists():
         platforms = L.load_json(root / ".helm/config.json", {}).get("platforms")
+    if isinstance(platforms, str):
+        platforms = [platforms]
 
     found_server = False
     missing_fields = []
-    default_cfg = ".agents/mcp_config.json" if (platforms and "antigravity" in platforms and "cursor" not in platforms) else ".cursor/mcp.json"
+    is_ag_primary = bool(platforms and "antigravity" in platforms and "cursor" not in platforms)
+    default_cfg = ".agents/mcp_config.json" if is_ag_primary else ".cursor/mcp.json"
     cfg_path_str = default_cfg
 
+    raw_candidates = (
+        [
+            root / ".agents/mcp_config.json",
+            root / ".cursor/mcp.json",
+            Path.home() / ".gemini/antigravity/mcp_config.json",
+            Path.home() / ".cursor/mcp.json",
+        ]
+        if is_ag_primary
+        else [
+            root / ".cursor/mcp.json",
+            root / ".agents/mcp_config.json",
+            Path.home() / ".cursor/mcp.json",
+            Path.home() / ".gemini/antigravity/mcp_config.json",
+        ]
+    )
     candidates = []
-    if not platforms or "cursor" in platforms:
-        candidates.append(root / ".cursor/mcp.json")
-    if platforms and "antigravity" in platforms:
-        candidates.append(root / ".agents/mcp_config.json")
-    if not candidates:
-        candidates.append(root / ".cursor/mcp.json")
-    candidates.append(Path.home() / ".cursor/mcp.json")
+    for c in raw_candidates:
+        if c not in candidates:
+            candidates.append(c)
+
+    first_missing_cfg_path = None
+    first_missing_fields = None
 
     for f in candidates:
         if not f.exists():
@@ -756,9 +794,12 @@ def inspect_atlassian_mcp(root, platforms=None):
             if "atlassian" in name.lower() or "jira" in name.lower():
                 found_server = True
                 try:
-                    cfg_path_str = str(f.relative_to(root))
+                    cur_cfg_path = str(f.relative_to(root))
                 except ValueError:
-                    cfg_path_str = "~/.cursor/mcp.json"
+                    if ".gemini/antigravity" in f.as_posix():
+                        cur_cfg_path = "~/.gemini/antigravity/mcp_config.json"
+                    else:
+                        cur_cfg_path = "~/.cursor/mcp.json"
                 env = spec.get("env", {}) if isinstance(spec, dict) else {}
                 url = env.get("JIRA_URL") or os.environ.get("JIRA_URL")
                 token = env.get("JIRA_API_TOKEN") or os.environ.get("JIRA_API_TOKEN")
@@ -776,10 +817,20 @@ def inspect_atlassian_mcp(root, platforms=None):
                             base_url = f"{parsed_u.scheme}://{parsed_u.netloc}"
                             if spec.get("env") and "JIRA_URL" in spec["env"]:
                                 spec["env"]["JIRA_URL"] = base_url
-                    return True, name, spec, [], cfg_path_str
-                missing_fields = cur_missing
-    if not found_server:
+                    return True, name, spec, [], cur_cfg_path
+                if first_missing_cfg_path is None:
+                    first_missing_cfg_path = cur_cfg_path
+                    first_missing_fields = cur_missing
+
+    if first_missing_cfg_path is not None:
+        cfg_path_str = first_missing_cfg_path
+        missing_fields = first_missing_fields or ["JIRA_URL", "JIRA_API_TOKEN"]
+    elif not found_server:
         missing_fields = ["JIRA_URL", "JIRA_API_TOKEN"]
+        for f in (root / default_cfg, root / ".cursor/mcp.json", root / ".agents/mcp_config.json"):
+            if f.exists():
+                cfg_path_str = str(f.relative_to(root))
+                break
     return False, None, None, missing_fields, cfg_path_str
 
 
@@ -882,6 +933,50 @@ def _run_mcp_session(mcp_spec, init_timeout=12.0):
     return proc, call_tool
 
 
+def _redact_mcp_secrets(msg: str, mcp_spec: dict | None) -> str:
+    """Ensure no credential or env value from mcp_spec is ever printed."""
+    if not msg:
+        return "unknown error"
+    out = str(msg)
+    env = (mcp_spec or {}).get("env", {}) if isinstance(mcp_spec, dict) else {}
+    for _, v in env.items():
+        if v and isinstance(v, str) and len(v.strip()) >= 3 and not is_mcp_placeholder(v):
+            out = out.replace(v, "***")
+            out = out.replace(v.strip(), "***")
+    return out
+
+
+def verify_atlassian_mcp_connection(mcp_spec: dict, timeout_sec: float = 12.0) -> tuple[bool, str]:
+    """Verify MCP server launches and authenticates against Jira without exposing sensitive data."""
+    proc, call_tool = _run_mcp_session(mcp_spec, init_timeout=timeout_sec)
+    if not proc:
+        reason = "MCP initialization timed out" if call_tool == "timeout" else str(call_tool)
+        return False, _redact_mcp_secrets(reason, mcp_spec)
+    try:
+        res = call_tool("jira_search", {"jql": "updated >= -30d ORDER BY updated DESC", "limit": 1}, timeout=timeout_sec)
+        if not res:
+            return False, "MCP query timed out"
+        if "error" in res:
+            return False, _redact_mcp_secrets(str(res["error"]), mcp_spec)
+        is_err = bool(res.get("result", {}).get("isError"))
+        content = res.get("result", {}).get("content", [])
+        text = " ".join(c.get("text", "") for c in content if isinstance(c, dict)).strip()
+        if is_err or any(w in text.lower() for w in ("401", "403", "unauthorized", "authentication failed", "invalid credentials")):
+            return False, _redact_mcp_secrets(text[:120] or "authentication failed", mcp_spec)
+        return True, "connected"
+    except Exception as e:
+        return False, _redact_mcp_secrets(str(e), mcp_spec)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
 def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=12.0):
     """Attempt to verify issue_key exists via configured Atlassian MCP server.
     Returns (status: 'found'|'not_found'|'timeout'|'error', info: str).
@@ -890,7 +985,7 @@ def query_jira_mcp(root, mcp_spec, issue_key, timeout_sec=12.0):
     if not proc:
         if call_tool == "timeout":
             return "timeout", "MCP initialize handshake timed out"
-        return "error", str(call_tool)
+        return "error", _redact_mcp_secrets(str(call_tool), mcp_spec)
 
     try:
         res2 = call_tool("jira_get_issue", {"issue_key": issue_key}, timeout=timeout_sec)
@@ -1421,8 +1516,10 @@ def cmd_start(a):
 
     if "antigravity" in platforms:
         ag_mcp = root / ".agents/mcp_config.json"
-        if not ag_mcp.exists() and not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
-            merge_mcp(ag_mcp, None)
+        if not ag_mcp.exists():
+            seed_mcp = (root / ".cursor/mcp.json") if (root / ".cursor/mcp.json").exists() else None
+            merge_mcp(ag_mcp, seed_mcp)
+            ensure_antigravity_env(root)
             L.integrity_refresh(root, pol)
             print(ctext("  ✔ Initialized .agents/mcp_config.json (Atlassian MCP configuration template)", "green"))
 
@@ -1522,6 +1619,7 @@ def cmd_start(a):
     # -------------------------------------------------------------------------
     has_mcp, mcp_name, mcp_spec, missing_mcp, mcp_cfg_path = inspect_atlassian_mcp(root, platforms)
     story_input = None
+    use_local_story = not has_mcp
     if has_mcp:
         clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name))
         print(ctext(f"✔ Atlassian MCP configured: {clean_name}", "cyan"))
@@ -1530,11 +1628,45 @@ def cmd_start(a):
         print(cwarn(f"Atlassian MCP is not connected in {mcp_cfg_path} (missing/placeholder: {missing_str})."))
         print(ctext(f"  To connect Jira, set JIRA_URL, JIRA_USERNAME, and JIRA_API_TOKEN in {mcp_cfg_path}.", "dim"))
         if is_interactive():
-            ans = prompt_user("? Continue in Local Story Mode (manual/paste story into STORY.md)? [Y/n]: ").strip().lower()
-            if ans in ("n", "no"):
-                die(f"task start cancelled — configure {mcp_cfg_path} and re-run `helm start`.")
-        print(ctext("ℹ Local Story Mode active (Atlassian MCP not connected).", "cyan"))
-        print(ctext("  Requirements will be captured locally in STORY.md.", "dim"))
+            setup_ans = prompt_user("? Do you want to set it up now? [Y/n]: ").strip().lower()
+            if setup_ans in ("", "y", "yes"):
+                while True:
+                    print(ctext(f"  1. Open {mcp_cfg_path} in your editor", "dim"))
+                    print(ctext(f"  2. Set JIRA_URL, JIRA_USERNAME, and JIRA_API_TOKEN, then save the file", "dim"))
+                    wait_ans = prompt_user("? Press Enter once saved to verify connection (or 's' to skip): ").strip().lower()
+                    L.integrity_refresh(root, pol)
+                    if wait_ans in ("s", "skip", "n", "no"):
+                        break
+                    has_mcp, mcp_name, mcp_spec, missing_mcp, mcp_cfg_path = inspect_atlassian_mcp(root, platforms)
+                    if not has_mcp:
+                        still_missing = ", ".join(missing_mcp) if missing_mcp else "JIRA_URL, JIRA_API_TOKEN"
+                        print(cwarn(f"{mcp_cfg_path} still has missing/placeholder fields ({still_missing})."))
+                    else:
+                        print(ctext("Verifying Atlassian MCP connection...", "dim"))
+                        ok, err_detail = verify_atlassian_mcp_connection(mcp_spec)
+                        if ok:
+                            use_local_story = False
+                            clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name))
+                            print(ctext(f"✔ Atlassian MCP connected and verified ({clean_name}).", "green"))
+                            break
+                        else:
+                            has_mcp = False
+                            print(cwarn(f"Atlassian MCP verification failed ({err_detail})."))
+
+                    retry_ans = prompt_user("? Continue in Local Story Mode (STORY.md)? [Y/n/r (retry)]: ").strip().lower()
+                    if retry_ans in ("r", "retry"):
+                        continue
+                    elif retry_ans in ("n", "no"):
+                        die(f"task start cancelled — configure {mcp_cfg_path} and re-run `helm start`.")
+                    else:
+                        break
+            else:
+                ans = prompt_user("? Continue in Local Story Mode (manual/paste story into STORY.md)? [Y/n]: ").strip().lower()
+                if ans in ("n", "no"):
+                    die(f"task start cancelled — configure {mcp_cfg_path} and re-run `helm start`.")
+        if use_local_story:
+            print(ctext("ℹ Local Story Mode active (Atlassian MCP not connected).", "cyan"))
+            print(ctext("  Requirements will be captured locally in STORY.md.", "dim"))
 
     while True:
         if not getattr(a, "id", None):
@@ -1620,6 +1752,7 @@ def cmd_start(a):
             continue
         elif action == "3":
             print(ctext(f"Proceeding with custom local task '{a.id}'.", "cyan"))
+            use_local_story = True
             break
         elif action == "4":
             die("task cancelled")
@@ -1629,7 +1762,7 @@ def cmd_start(a):
             continue
 
     story_input = getattr(a, "story", None)
-    if not story_input and not has_mcp and is_interactive():
+    if not story_input and use_local_story and is_interactive():
         story_input = prompt_user("? Enter Story / Requirements summary (or press Enter to describe later): ").strip()
 
     # -------------------------------------------------------------------------
@@ -1684,7 +1817,9 @@ def cmd_start(a):
     # -------------------------------------------------------------------------
     # 6. Task Registration & Activation
     # -------------------------------------------------------------------------
+    story_source = "local" if (story_input or use_local_story) else "jira"
     L.save_task(root, a.id, {"id": a.id, "tier": a.tier, "created": L.now(), "user": identity(root),
+                             "story_source": story_source,
                              "baseline": {"head": snap["head"], "git": snap, "diff": L.diff_sha(root, snap["head"])}})
     L.append_record(root, a.id, {"gate": "task", "decision": "start", "user": identity(root), "note": f"Tier {a.tier}"})
     L.set_active(root, {"kind": "task", "task": a.id, "tier": a.tier})
@@ -2191,21 +2326,17 @@ def cmd_work(a):
     story_arg = getattr(a, "story", None) or getattr(a, "story_flag", None)
     story_file = wd / "STORY.md"
     has_mcp, mcp_name, _ = check_atlassian_mcp(root)
+    trec = L.load_task(root, task_id) or {}
 
     if story_arg:
         story_file.write_text(story_arg.strip() + "\n", encoding="utf-8")
         print(ctext(f"✔ Saved story requirements to {L.WORK_REL}/{task_id}/STORY.md", "green"))
     elif story_file.exists():
         print(ctext(f"✔ Using story requirements from {L.WORK_REL}/{task_id}/STORY.md", "green"))
-    elif has_mcp:
-        clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name))
+    elif has_mcp or trec.get("story_source") == "jira":
+        clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name or "atlassian"))
         print(ctext(f"✔ Task '{task_id}' linked to Jira via Atlassian MCP ({clean_name}).", "cyan"))
         print(ctext("  (Discovery agent will retrieve acceptance criteria directly from Jira)", "dim"))
-    elif is_interactive():
-        ans = prompt_user("? Enter Story / Requirements summary (or press Enter to describe later): ").strip()
-        if ans:
-            story_file.write_text(ans + "\n", encoding="utf-8")
-            print(ctext(f"✔ Saved story requirements to {L.WORK_REL}/{task_id}/STORY.md", "green"))
 
     # 2. Check phase
     manual = getattr(a, "manual", False)
@@ -2572,47 +2703,194 @@ def cmd_abort(a):
     print("aborted. Working-tree changes (if any) are yours to keep or revert with Git.")
 
 
+def _collect_clean_targets(root: Path) -> list[str]:
+    targets = []
+    for d in (".helm", ".agents", ".claude", ".codex"):
+        p = root / d
+        if p.exists() or p.is_symlink():
+            targets.append(f"{d}/")
+    cu = root / ".cursor"
+    if cu.exists() or cu.is_symlink():
+        cu_items = ("agents", "commands", "skills", "cli.json", "hooks.json", "mcp.json")
+        if any((cu / sub).exists() or (cu / sub).is_symlink() for sub in cu_items):
+            targets.append(".cursor/ (HELM hooks, agents, commands, skills, mcp)")
+    agents_md = root / "AGENTS.md"
+    if agents_md.exists():
+        try:
+            txt = agents_md.read_text(encoding="utf-8")
+            if "<!-- HELM:BEGIN" in txt:
+                a = txt.index("<!-- HELM:BEGIN")
+                b = txt.rindex("<!-- HELM:END -->") + len("<!-- HELM:END -->") if "<!-- HELM:END -->" in txt else len(txt)
+                rem = (txt[:a] + txt[b:]).strip()
+                targets.append("AGENTS.md" if not rem else "AGENTS.md (HELM block)")
+        except Exception:
+            pass
+    gi = root / ".gitignore"
+    if gi.exists():
+        try:
+            gi_txt = gi.read_text(encoding="utf-8")
+            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor"]))
+            if "# HELM local developer governance files" in gi_txt or any(line.strip() in helm_ignores for line in gi_txt.splitlines()):
+                targets.append(".gitignore (HELM ignore entries)")
+        except Exception:
+            pass
+    return targets
+
+
+def _remove_helm_setup(root: Path) -> list[str]:
+    removed = []
+    for d in (".helm", ".agents", ".claude", ".codex"):
+        p = root / d
+        if p.exists() or p.is_symlink():
+            if p.is_symlink() or p.is_file():
+                p.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(p, ignore_errors=True)
+            removed.append(f"{d}/")
+
+    cu = root / ".cursor"
+    if cu.exists() or cu.is_symlink():
+        cu_removed = False
+        for sub in ("agents", "commands", "skills", "cli.json", "hooks.json", "mcp.json"):
+            sp = cu / sub
+            if sp.exists() or sp.is_symlink():
+                if sp.is_symlink() or sp.is_file():
+                    sp.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(sp, ignore_errors=True)
+                cu_removed = True
+        if cu.is_dir():
+            rem_entries = [x for x in cu.iterdir() if x.name != ".DS_Store"]
+            if not rem_entries:
+                shutil.rmtree(cu, ignore_errors=True)
+                if cu_removed:
+                    removed.append(".cursor/")
+            elif cu_removed:
+                removed.append(".cursor/ (HELM files)")
+        elif cu_removed:
+            removed.append(".cursor/")
+
+    agents_md = root / "AGENTS.md"
+    if agents_md.exists():
+        try:
+            txt = agents_md.read_text(encoding="utf-8")
+            if "<!-- HELM:BEGIN" in txt:
+                a = txt.index("<!-- HELM:BEGIN")
+                b = txt.rindex("<!-- HELM:END -->") + len("<!-- HELM:END -->") if "<!-- HELM:END -->" in txt else len(txt)
+                cleaned = (txt[:a] + txt[b:]).strip()
+                if cleaned:
+                    agents_md.write_text(cleaned + "\n", encoding="utf-8")
+                    removed.append("AGENTS.md (HELM block)")
+                else:
+                    agents_md.unlink(missing_ok=True)
+                    removed.append("AGENTS.md")
+        except Exception:
+            pass
+
+    gi = root / ".gitignore"
+    if gi.exists():
+        try:
+            lines = gi.read_text(encoding="utf-8").splitlines()
+            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor"]))
+            marker = "# HELM local developer governance files"
+            new_lines = []
+            in_helm_block = False
+            changed_gi = False
+            for line in lines:
+                s = line.strip()
+                if s == marker:
+                    in_helm_block = True
+                    changed_gi = True
+                    continue
+                if in_helm_block:
+                    if s in helm_ignores or not s:
+                        changed_gi = True
+                        continue
+                    in_helm_block = False
+                new_lines.append(line)
+            if changed_gi:
+                cleaned_gi = "\n".join(new_lines).rstrip()
+                if cleaned_gi:
+                    gi.write_text(cleaned_gi + "\n", encoding="utf-8")
+                    removed.append(".gitignore (HELM entries)")
+                else:
+                    rc, _ = L.git_run(root, ["ls-files", "--error-unmatch", ".gitignore"])
+                    if rc != 0:
+                        gi.unlink(missing_ok=True)
+                        removed.append(".gitignore")
+                    else:
+                        gi.write_text("", encoding="utf-8")
+                        removed.append(".gitignore (HELM entries)")
+        except Exception:
+            pass
+
+    st_dir = L.state_dir(root)
+    if st_dir.exists():
+        shutil.rmtree(st_dir, ignore_errors=True)
+
+    return removed
+
+
 def cmd_reset(a):
-    root, pol = ctx()
+    root = L.find_root()
     active, _ = L.load_active(root)
     active_task = active.get("task") if active else None
     clean = getattr(a, "clean", False)
 
     # ── Determine what will be deleted so the user knows exactly ──────────────
     work_dir = root / L.WORK_REL
-    task_dirs = sorted(work_dir.iterdir()) if clean and work_dir.exists() else []
+    task_dirs = sorted(work_dir.iterdir()) if work_dir.exists() else []
+    clean_targets = _collect_clean_targets(root) if clean else []
 
     # ── Summary banner ────────────────────────────────────────────────────────
     border = "─" * 70
     print(ctext(f"\n┌{border}┐", "bold_orange"))
-    print(ctext(f"│  🗑  HELM Reset", "bold_orange"))
+    print(ctext(f"│  🗑  HELM Reset{' (--clean)' if clean else ''}", "bold_orange"))
     print(ctext(f"├{border}┤", "bold_orange"))
     if active_task:
         print(f"│  Active task     : {active_task}")
     else:
         print(f"│  Active task     : (none)")
     if clean:
+        print(f"│  Repository      : {root}")
+        if clean_targets:
+            print(f"│  Generated files : {len(clean_targets)} target(s) to remove")
+            for t in clean_targets:
+                print(f"│    ✗ {t}")
+        else:
+            print("│  Generated files : (none found)")
+    else:
         print(f"│  Work artifacts  : {work_dir} ({len(task_dirs)} director{'y' if len(task_dirs) == 1 else 'ies'})")
         for d in task_dirs:
             print(f"│    ✗ {d.name}")
-    else:
-        print(f"│  Work artifacts  : preserved (use --clean to also wipe .helm/work/)")
+        print("│  Framework files : preserved (use --clean to remove all HELM setup files)")
     print(ctext(f"└{border}┘\n", "bold_orange"))
 
     # ── Require TTY for interactive confirmation ───────────────────────────────
     require_tty()
 
     if clean:
-        print(ctext("⚠  This will permanently delete all task artifacts and cannot be undone.", "bold_orange"))
+        print(ctext("⚠  This will permanently remove all HELM setup files and task artifacts from this repository.", "bold_orange"))
         ans = prompt_user("? Are you sure? Type 'yes' to confirm, anything else to cancel: ").strip().lower()
         if ans != "yes":
             die("Reset cancelled — nothing was deleted.")
     else:
-        ans = prompt_user(f"? Clear active task state{(' for ' + active_task) if active_task else ''}? [y/N]: ").strip().lower()
+        ans = prompt_user(f"? Clear active task state{(' for ' + active_task) if active_task else ''} and task artifacts? [y/N]: ").strip().lower()
         if ans not in ("y", "yes"):
             die("Reset cancelled — nothing was changed.")
 
     # ── Execute reset ─────────────────────────────────────────────────────────
+    if clean:
+        L.clear_active(root)
+        removed = _remove_helm_setup(root)
+        print(ctext("✔ Task state cleared.", "green"))
+        if removed:
+            print(ctext(f"✔ Removed HELM setup files: {', '.join(removed)}", "green"))
+        else:
+            print(ctext("✔ No HELM setup files found to clean.", "green"))
+        print(ctext("\n✨ HELM completely removed from repository.\n", "cyan"))
+        return
+
     if active_task:
         try:
             L.append_record(root, active_task, {
@@ -2630,15 +2908,13 @@ def cmd_reset(a):
         L.clear_active(root)
         print(ctext("✔ Task state cleared (was already empty).", "green"))
 
-    if clean and task_dirs:
+    if task_dirs:
         for d in task_dirs:
             try:
                 shutil.rmtree(d)
             except Exception as e:
                 print(cwarn(f"Could not remove {d.name}: {e}"))
         print(ctext(f"✔ Wiped {len(task_dirs)} task director{'y' if len(task_dirs) == 1 else 'ies'} from {L.WORK_REL}/", "green"))
-    elif clean:
-        print(ctext("✔ No task artifacts found to clean.", "green"))
 
     print(ctext("\n✨ HELM state reset — ready to start fresh.\n", "cyan"))
 
@@ -2986,7 +3262,12 @@ def doctor_checks(root, pol):
     sp = skills_verify(root, quiet=True)
     add("PASS" if not sp else "FAIL", "skills: all discovered skills approved + unmodified" if not sp else f"skills: {len(sp)} problem(s) — run `helm skills verify`")
     mcps = {}
-    for f in (root / ".cursor/mcp.json", Path.home() / ".cursor/mcp.json"):
+    for f in (
+        root / ".cursor/mcp.json",
+        root / ".agents/mcp_config.json",
+        Path.home() / ".cursor/mcp.json",
+        Path.home() / ".gemini/antigravity/mcp_config.json",
+    ):
         mcps.update(((L.load_json(f, {}) or {}).get("mcpServers", {})))
     allowed = set(pol["mcp"]["allow_servers"])
     extra = sorted(set(mcps) - allowed)
@@ -3263,7 +3544,7 @@ def main():
     s.set_defaults(f=cmd_abort)
 
     s = sp.add_parser("reset", help="Clear all HELM state and start from scratch")
-    s.add_argument("--clean", action="store_true", help="Also wipe all task artifacts in .helm/work/")
+    s.add_argument("--clean", action="store_true", help="Remove all HELM setup files (.helm/, .agents/, .cursor/, AGENTS.md, etc.) from the repository")
     s.set_defaults(f=cmd_reset)
 
     s = sp.add_parser("finish", help="Complete task and promote human decisions")

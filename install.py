@@ -276,7 +276,7 @@ def insert_block(agents: Path, block: str):
     if agents.exists():
         txt = agents.read_text()
         if BEGIN in txt and END in txt:
-            a, b = txt.index(BEGIN), txt.index(END) + len(END)
+            a, b = txt.index(BEGIN), txt.rindex(END) + len(END)
             txt = txt[:a] + block.rstrip("\n") + txt[b:]
         else:
             txt = txt.rstrip("\n") + "\n\n" + block
@@ -467,6 +467,11 @@ def main():
         ag_skills = repo / ".agents/skills"
         ag_skills.mkdir(parents=True, exist_ok=True)
         platform_skills_dirs.append(ag_skills)
+        ag_mcp = repo / ".agents/mcp_config.json"
+        if not ag_mcp.exists():
+            seed_src = (repo / ".cursor/mcp.json") if (repo / ".cursor/mcp.json").exists() else (PAYLOAD / ".cursor/mcp.json")
+            merge_mcp(ag_mcp, seed_src)
+            say("initialized .agents/mcp_config.json (set JIRA_URL, JIRA_USERNAME & JIRA_API_TOKEN for Jira integration)")
     if "claude" in platforms:
         cl_skills = repo / ".claude/skills"
         cl_skills.mkdir(parents=True, exist_ok=True)

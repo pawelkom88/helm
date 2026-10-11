@@ -40,11 +40,23 @@ When run in an interactive terminal without arguments:
 2. Prompts for Workflow Tier:
    * **[1] Tier 1 — Quick / Small**: Brief + Plan merged into `WORK.md`, 1 upfront gate.
    * **[2] Tier 2 — Standard / Complex**: Discovery → Plan → Test Plan → Implement → Full Review.
-3. Checks for Atlassian MCP configuration in `.cursor/mcp.json`. If present, reports the server name; if missing, displays a helpful note.
+3. Automatically sets up the target platform:
+   * **Default**: Seamlessly configures **Cursor** with zero interactive menus.
+   * **Antigravity**: Pass `--ag` or `--platform antigravity` to initialize `.agents/` and Antigravity tool guardrails.
+   * **Claude Code / Codex / All**: Pass `--platform claude`, `--platform codex`, or `--platform all`.
+4. Checks for Atlassian MCP configuration (`.cursor/mcp.json` or `.agents/mcp_config.json`). If present, reports the server name; if missing, displays a helpful note.
 
-*Non-interactive usage:*
+*CLI usage examples:*
 ```bash
+# Standard Cursor workflow:
 helm start FEAT-101 --tier 1
+
+# Google Antigravity workflow:
+helm start FEAT-101 --ag
+# or: helm start FEAT-101 --platform antigravity --tier 2
+
+# Multi-platform setup:
+helm start FEAT-101 --platform all
 ```
 
 ### Interactive `helm approve`
@@ -124,7 +136,7 @@ To prevent accidental data loss or destructive rogue agent activity:
 ### Human Workflow Commands (Human TTY Required)
 | Command | Arguments | Description |
 |---|---|---|
-| `helm start` | `[id] [--tier 1\|2] [--allow-dirty]` | Start a task with interactive ID and tier selection |
+| `helm start` | `[id] [--tier 1\|2] [--platform ...] [--ag] [--allow-dirty]` | Start a task (defaults to Cursor; pass `--ag` for Antigravity) |
 | `helm approve` | `[gate] [--override]` | Approve pending gate (`discovery`, `plan`, `final`) |
 | `helm reject` | `[gate] [-m "message"]` | Reject gate and write feedback to `FEEDBACK.md` |
 | `helm unblock` | `[-m "instruction"]` | Provide human resolution for an agent stuck in `BLOCKED` |

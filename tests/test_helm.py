@@ -960,17 +960,19 @@ class TestInteractiveCLI(Base):
         self.assertIn("Atlassian MCP in .cursor/mcp.json requires credentials (JIRA_URL, JIRA_API_TOKEN)", out)
 
     def test_interactive_start_prompts(self):
-        # 1. Declining Local Story Mode when Atlassian MCP has placeholder credentials stops cleanly
-        code, out = self.tty_run("start", lines=["n"])
+        # 1. Declining setup ('n') and declining Local Story Mode ('n') stops cleanly
+        code, out = self.tty_run("start", lines=["n", "n"])
         self.assertNotEqual(code, 0)
         self.assertIn("Atlassian MCP is not connected in .cursor/mcp.json (missing/placeholder: JIRA_URL, JIRA_API_TOKEN)", out)
+        self.assertIn("Do you want to set it up now? [Y/n]:", out)
         self.assertIn("Continue in Local Story Mode", out)
         self.assertIn("configure .cursor/mcp.json and re-run `helm start`", out)
 
-        # 2. Consciously accepting Local Story Mode proceeds and saves STORY.md
-        code, out = self.tty_run("start", lines=["y", "INT-1", "Implement reusable filter", "1", "8"])
+        # 2. Declining setup ('n') and accepting Local Story Mode ('y') proceeds and saves STORY.md
+        code, out = self.tty_run("start", lines=["n", "y", "INT-1", "Implement reusable filter", "1", "8"])
         self.assertEqual(code, 0, out)
         self.assertIn("Atlassian MCP is not connected in .cursor/mcp.json", out)
+        self.assertIn("Do you want to set it up now? [Y/n]:", out)
         self.assertIn("Local Story Mode active (Atlassian MCP not connected).", out)
         self.assertIn("Enter Task / Jira ID", out)
         self.assertIn("Tier 1 — Quick / Small", out)
@@ -981,9 +983,9 @@ class TestInteractiveCLI(Base):
         self.assertEqual(st.get("tier"), 1)
         self.tty_run("abort", lines=["INT-1"])
 
-        # 3. Missing .cursor/mcp.json is auto-initialized during helm start pre-flight
+        # 3. Missing .cursor/mcp.json is auto-initialized during helm start pre-flight (and 's' skips setup verification to Local Story Mode)
         (self.repo / ".cursor/mcp.json").unlink()
-        code, out = self.tty_run("start", lines=["y", "INT-MCP", "", "1", "8"])
+        code, out = self.tty_run("start", lines=["y", "s", "INT-MCP", "", "1", "8"])
         self.assertEqual(code, 0, out)
         self.assertTrue((self.repo / ".cursor/mcp.json").exists())
         self.assertIn("Initialized .cursor/mcp.json", out)
@@ -991,7 +993,7 @@ class TestInteractiveCLI(Base):
 
         # 4. Interactive dirty tree fallback prompt (allow)
         (self.repo / "src/app.ts").write_text("export const a = 99;\n")
-        code, out = self.tty_run("start", lines=["y", "y", "INT-2", "", "1", "8"])
+        code, out = self.tty_run("start", lines=["y", "n", "y", "INT-2", "", "1", "8"])
         self.assertEqual(code, 0, out)
         self.assertIn("Uncommitted changes detected in working tree.", out)
         self.assertIn("Allow starting with uncommitted changes?", out)
@@ -1002,6 +1004,121 @@ class TestInteractiveCLI(Base):
         code, out = self.tty_run("start", lines=["n"])
         self.assertNotEqual(code, 0)
         self.assertIn("working tree is not clean", out)
+
+    def test_interactive_mcp_setup_and_verification(self):
+        # Mock MCP server that fails when token is 'bad_secret_token_999' (and echoes token in error to test redaction),
+        # and succeeds when token is 'valid_secret_token_123'
+        mock_py = self.tmp / "mock_mcp_verify.py"
+        mock_py.write_text("""import os, sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+token = os.environ.get("JIRA_API_TOKEN", "")
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    mid = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name")
+        if token != "valid_secret_token_123":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": f"401 Unauthorized for token {token}"}], "isError": True}})
+        elif name == "jira_search":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"issues": [{"key": "PROJ-10", "summary": "Test issue"}]})}]}})
+        elif name == "jira_get_issue":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps({"key": "PROJ-10", "summary": "Test issue"})}]}})
+""")
+
+        # 1. Start helm in PTY while .cursor/mcp.json has placeholders:
+        #    - Choose 'y' to "Do you want to set it up now? [Y/n]:"
+        #    - First press Enter while file still has bad token -> verification fails, secret token is redacted ('***'), choose 'r' to retry
+        #    - Update file with valid token, press Enter -> verification succeeds, verifies PROJ-10 without Local Story Mode
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            os.execvpe(sys.executable, [sys.executable, str(self.repo / ".helm/bin/helm"), "start"], self.env)
+
+        out = b""
+
+        def read_until(substr, timeout=8.0):
+            nonlocal out
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if substr.encode() in out:
+                    return
+                import select
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if r:
+                    try:
+                        chunk = os.read(fd, 4096)
+                        if not chunk:
+                            break
+                        out += chunk
+                    except OSError:
+                        break
+
+        read_until("Do you want to set it up now? [Y/n]:")
+        os.write(fd, b"y\n")
+        read_until("Press Enter once saved to verify connection")
+
+        # Write invalid token to .cursor/mcp.json
+        bad_cfg = {
+            "mcpServers": {
+                "atlassian": {
+                    "command": sys.executable,
+                    "args": [str(mock_py)],
+                    "env": {
+                        "JIRA_URL": "https://secret-domain.atlassian.net",
+                        "JIRA_USERNAME": "secret.user@example.com",
+                        "JIRA_API_TOKEN": "bad_secret_token_999"
+                    }
+                }
+            }
+        }
+        (self.repo / ".cursor/mcp.json").write_text(json.dumps(bad_cfg, indent=2))
+        os.write(fd, b"\n")
+
+        read_until("Continue in Local Story Mode (STORY.md)? [Y/n/r (retry)]:")
+        # Choose 'r' to retry after fixing the file
+        os.write(fd, b"r\n")
+        read_until("Press Enter once saved to verify connection")
+
+        # Fix token in .cursor/mcp.json
+        good_cfg = dict(bad_cfg)
+        good_cfg["mcpServers"]["atlassian"]["env"]["JIRA_API_TOKEN"] = "valid_secret_token_123"
+        (self.repo / ".cursor/mcp.json").write_text(json.dumps(good_cfg, indent=2))
+        os.write(fd, b"\n")
+
+        read_until("Enter Task / Jira ID")
+        os.write(fd, b"PROJ-10\n1\n8\n")
+
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                out += chunk
+            except OSError:
+                break
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        out_str = out.decode(errors="replace")
+
+        self.assertEqual(code, 0, out_str)
+        self.assertIn("Atlassian MCP verification failed", out_str)
+        # Sensitive values must never appear in terminal output
+        self.assertNotIn("bad_secret_token_999", out_str)
+        self.assertNotIn("valid_secret_token_123", out_str)
+        self.assertIn("***", out_str)
+        self.assertIn("Atlassian MCP connected and verified (atlassian).", out_str)
+        self.assertIn("Jira ticket 'PROJ-10' verified", out_str)
+        self.assertNotIn("Local Story Mode active", out_str)
+        self.tty_run("abort", lines=["PROJ-10"])
 
     def test_keyboard_interrupt_exits_cleanly(self):
         pid, fd = pty.fork()
@@ -1619,8 +1736,102 @@ class TestMultiPlatform(Base):
         self.assertTrue((all_repo / ".claude/settings.json").exists())
         self.assertTrue((all_repo / ".codex/hooks.json").exists())
 
+    def test_ag_switch_seeds_mcp_config_and_work_does_not_reprompt(self):
+        # 1. Start with a repo that already has .cursor/mcp.json (like self.repo)
+        #    and a broken symlink inside a protected directory (.claude/skills/vercel-react-view-transitions)
+        self.assertTrue((self.repo / ".cursor/mcp.json").exists())
+        self.assertFalse((self.repo / ".agents/mcp_config.json").exists())
+        broken_dir = self.repo / ".claude/skills"
+        broken_dir.mkdir(parents=True, exist_ok=True)
+        broken_link = broken_dir / "vercel-react-view-transitions"
+        broken_link.symlink_to("/nonexistent/path/to/skill")
+        self.assertTrue(broken_link.is_symlink())
+        self.assertFalse(broken_link.exists())
+
+        # Put valid credentials in .cursor/mcp.json
+        mcp_data = json.loads((self.repo / ".cursor/mcp.json").read_text())
+        mcp_data["mcpServers"]["atlassian"]["env"]["JIRA_URL"] = "https://acme.atlassian.net"
+        mcp_data["mcpServers"]["atlassian"]["env"]["JIRA_API_TOKEN"] = "real_secret_token"
+        (self.repo / ".cursor/mcp.json").write_text(json.dumps(mcp_data, indent=2))
+        self.tty_run("integrity", "refresh", lines=["refresh"])
+
+        # 2. Run helm start --ag -> must create .agents/mcp_config.json seeded from .cursor/mcp.json
+        r = subprocess.run(
+            [sys.executable, str(self.repo / ".helm/bin/helm"), "start", "--ag", "RPF-51", "--tier", "2", "--allow-dirty"],
+            cwd=self.repo,
+            env=self.env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        self.assertTrue((self.repo / ".agents/mcp_config.json").exists())
+        ag_mcp = json.loads((self.repo / ".agents/mcp_config.json").read_text())
+        self.assertEqual(ag_mcp["mcpServers"]["atlassian"]["env"]["JIRA_URL"], "https://acme.atlassian.net")
+        self.assertEqual(ag_mcp["mcpServers"]["atlassian"]["env"]["JIRA_API_TOKEN"], "real_secret_token")
+
+        # 3. Running helm work --manual must NOT prompt for "Enter Story / Requirements summary"
+        code, out = self.tty_run("work", "--manual", lines=[])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Enter Story / Requirements summary", out)
+        self.assertIn("HELM Agent Dispatch: DISCOVERY", out)
+
+    def test_helm_reset_and_reset_clean_removes_all_setup_files(self):
+        ag_repo = self.tmp / "reset-clean-repo"
+        ag_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=ag_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=ag_repo)
+        sh("git", "config", "user.name", "Dev", cwd=ag_repo)
+        (ag_repo / "main.py").write_text("print('ag')\n")
+        (ag_repo / ".gitignore").write_text("node_modules/\n")
+        sh("git", "add", ".", cwd=ag_repo)
+        sh("git", "commit", "-qm", "init", cwd=ag_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(ag_repo))
+        r = subprocess.run(
+            [sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--ag", "CLEAN-1", "--tier", "1", "--allow-dirty"],
+            cwd=ag_repo,
+            env=repo_env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((ag_repo / ".helm").exists())
+        self.assertTrue((ag_repo / ".agents").exists())
+        self.assertTrue((ag_repo / "AGENTS.md").exists())
+        self.assertIn(".helm/", (ag_repo / ".gitignore").read_text())
+
+        # Run helm reset --clean via pseudo-terminal
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(ag_repo)
+            os.execvpe(sys.executable, [sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "reset", "--clean"], repo_env)
+        os.write(fd, b"yes\n")
+        out = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                out += chunk
+            except OSError:
+                break
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        out_str = out.decode(errors="replace")
+        self.assertEqual(code, 0, out_str)
+        self.assertIn("HELM completely removed from repository", out_str)
+
+        # Verify all generated HELM setup files are removed and user's original .gitignore is preserved
+        self.assertFalse((ag_repo / ".helm").exists())
+        self.assertFalse((ag_repo / ".agents").exists())
+        self.assertFalse((ag_repo / "AGENTS.md").exists())
+        self.assertEqual((ag_repo / ".gitignore").read_text(), "node_modules/\n")
+        self.assertFalse(L.state_dir(ag_repo).exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
 
 

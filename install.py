@@ -104,11 +104,37 @@ def get_platform_gitignores(platforms: list[str]) -> list[str]:
 
 
 MERGED = {".cursor/hooks.json", ".cursor/cli.json", ".cursor/mcp.json"}
-KEEP_IF_EXISTS = {".helm/skills.lock.json"}
+KEEP_IF_EXISTS: set[str] = set()
 
 
 def say(msg):
     print(f"  {msg}")
+
+
+def merge_skills_lock(dst: Path, src: Path) -> bool:
+    try:
+        ours = json.loads(src.read_text()) if src.exists() else {"skills": []}
+    except Exception:
+        ours = {"skills": []}
+    try:
+        cur = json.loads(dst.read_text()) if dst.exists() else {"skills": []}
+    except Exception:
+        cur = {"skills": []}
+    if not isinstance(ours, dict) or not isinstance(ours.get("skills"), list):
+        ours = {"skills": []}
+    if not isinstance(cur, dict) or not isinstance(cur.get("skills"), list):
+        cur = {"skills": []}
+    existing_names = {s.get("name") for s in cur["skills"] if isinstance(s, dict) and "name" in s}
+    added = False
+    for s in ours["skills"]:
+        if isinstance(s, dict) and s.get("name") and s["name"] not in existing_names:
+            cur["skills"].append(s)
+            existing_names.add(s["name"])
+            added = True
+    if not dst.exists() or added:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(json.dumps(cur, indent=2) + "\n")
+    return added
 
 
 def merge_hooks(dst: Path, src: Path):
@@ -337,7 +363,7 @@ def main():
             continue
         if rel.startswith(".cursor/") and "cursor" not in platforms:
             continue
-        if rel.startswith((".cursor/skills/", ".agents/skills/", ".claude/skills/", ".codex/skills/")):
+        if rel.startswith((".cursor/skills/", ".agents/skills/", ".claude/skills/", ".codex/skills/", ".helm/repo/")):
             continue
 
         dst = repo / rel
@@ -360,6 +386,13 @@ def main():
         elif rel == ".cursor/mcp.json":
             merge_mcp(dst, src)
             say("initialized .cursor/mcp.json (set JIRA_URL, JIRA_USERNAME & JIRA_API_TOKEN for Jira integration)")
+        elif rel == ".helm/skills.lock.json":
+            had_dst = dst.exists()
+            added = merge_skills_lock(dst, src)
+            if not had_dst:
+                say("initialized .helm/skills.lock.json with bundled skills")
+            elif added:
+                say("merged .helm/skills.lock.json (bundled skills registered)")
         elif rel in KEEP_IF_EXISTS and dst.exists():
             continue
         elif rel == ".helm/policy/policy.json" and dst.exists() and dst.read_bytes() != src.read_bytes() and not a.reset_policy:
@@ -369,14 +402,38 @@ def main():
             shutil.copy2(src, dst)
 
     # Ensure skill directories exist for active platforms
+    platform_skills_dirs = []
     if "antigravity" in platforms:
-        (repo / ".agents/skills").mkdir(parents=True, exist_ok=True)
+        ag_skills = repo / ".agents/skills"
+        ag_skills.mkdir(parents=True, exist_ok=True)
+        platform_skills_dirs.append(ag_skills)
     if "claude" in platforms:
-        (repo / ".claude/skills").mkdir(parents=True, exist_ok=True)
+        cl_skills = repo / ".claude/skills"
+        cl_skills.mkdir(parents=True, exist_ok=True)
+        platform_skills_dirs.append(cl_skills)
     if "codex" in platforms:
-        (repo / ".codex/skills").mkdir(parents=True, exist_ok=True)
+        cx_skills = repo / ".codex/skills"
+        cx_skills.mkdir(parents=True, exist_ok=True)
+        platform_skills_dirs.append(cx_skills)
     if "cursor" in platforms:
-        (repo / ".cursor/skills").mkdir(parents=True, exist_ok=True)
+        cu_skills = repo / ".cursor/skills"
+        cu_skills.mkdir(parents=True, exist_ok=True)
+        platform_skills_dirs.append(cu_skills)
+
+    # Copy bundled skills to active platform directories if not already present
+    bundled_skills_src = PAYLOAD / ".cursor/skills"
+    if bundled_skills_src.exists():
+        copied_skills = set()
+        for s_dir in sorted(bundled_skills_src.iterdir()):
+            if not s_dir.is_dir():
+                continue
+            for p_dir in platform_skills_dirs:
+                target_skill = p_dir / s_dir.name
+                if not target_skill.exists():
+                    shutil.copytree(s_dir, target_skill, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc"))
+                    copied_skills.add(s_dir.name)
+        if copied_skills:
+            say(f"copied bundled skills to active platform(s): {', '.join(sorted(copied_skills))}")
 
     for f in ("helm", "helm_guard.py", "helm_lib.py"):
         os.chmod(repo / ".helm/bin" / f, 0o755)

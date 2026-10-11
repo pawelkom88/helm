@@ -667,6 +667,150 @@ class TestSkills(Base):
         self.assertEqual(c, 0, o)
         self.assertIn("notes.md:1", o)
 
+    def test_bundled_skills_preseeded_and_valid(self):
+        skills_dir = BUNDLE / "payload/.cursor/skills"
+        lock_file = BUNDLE / "payload/.helm/skills.lock.json"
+
+        def calc_folder_hash(d):
+            h, files = L.hashlib.sha256(), []
+            for p in sorted(x for x in d.rglob("*") if x.is_file()):
+                rel = p.relative_to(d).as_posix()
+                files.append(rel)
+                h.update(rel.encode() + b"\0" + L.sha256_file(p).encode() + b"\0")
+            return h.hexdigest(), files
+
+        meta_map = {
+            "fowler-code-craft": {"source": "local:gemini/skills/fowler-code-craft", "commit": "b0f719e0", "license": "MIT", "scope": "architecture,refactoring"},
+            "grill-with-docs": {"source": "https://github.com/mattpocock/skills", "commit": "49dd158d", "license": "MIT", "scope": "workflow,design"},
+            "playwright-best-practices": {"source": "https://github.com/currents-dev/playwright-best-practices-skill", "commit": "283d5cbc", "license": "Apache-2.0", "scope": "testing,e2e"},
+            "react-composition-patterns": {"source": "https://github.com/vercel-labs/agent-skills", "commit": "063bee94", "license": "MIT", "scope": "frontend,react19"},
+            "tanstack-query": {"source": "https://github.com/DeckardGer/tanstack-agent-skills", "commit": "b2fc14c9", "license": "MIT", "scope": "frontend,data-fetching"},
+            "vercel-react-best-practices": {"source": "https://github.com/vercel-labs/agent-skills", "commit": "063bee94", "license": "MIT", "scope": "frontend,react19,perf"},
+        }
+
+        bundled = sorted(d.name for d in skills_dir.iterdir() if d.is_dir())
+        self.assertEqual(bundled, sorted(meta_map.keys()))
+
+        skills_list = []
+        for name in bundled:
+            d = skills_dir / name
+            chash, files = calc_folder_hash(d)
+            meta = meta_map[name]
+            skills_list.append({
+                "name": name,
+                "source": meta["source"],
+                "commit": meta["commit"],
+                "license": meta["license"],
+                "reviewer": "bundled",
+                "approved": "2026-10-11",
+                "scope": meta["scope"],
+                "content_sha": chash,
+                "files": files,
+                "has_scripts": False,
+            })
+
+        lock_data = {"skills": skills_list}
+        cur_lock = json.loads(lock_file.read_text())
+        self.assertEqual(cur_lock, lock_data)
+        shutil.copy2(lock_file, self.repo / ".helm/skills.lock.json")
+        r = self.helm("skills", "verify", check=False)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_multiplatform_install_and_skills_verify(self):
+        new_repo = self.tmp / "multi_repo"
+        new_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=new_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=new_repo)
+        sh("git", "config", "user.name", "Dev", cwd=new_repo)
+        (new_repo / "app.py").write_text("print('test')\n")
+        sh("git", "add", ".", cwd=new_repo)
+        sh("git", "commit", "-qm", "init", cwd=new_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(new_repo))
+        sh(sys.executable, str(BUNDLE / "install.py"), str(new_repo), "--platform", "all", cwd=new_repo, env=repo_env)
+        expected_skills = {"fowler-code-craft", "grill-with-docs", "playwright-best-practices",
+                           "react-composition-patterns", "tanstack-query", "vercel-react-best-practices"}
+        for pdir in [".agents/skills", ".claude/skills", ".codex/skills", ".cursor/skills"]:
+            present = {d.name for d in (new_repo / pdir).iterdir() if d.is_dir()}
+            self.assertEqual(present, expected_skills, f"Mismatch in {pdir}")
+
+        r = subprocess.run([sys.executable, str(new_repo / ".helm/bin/helm"), "skills", "verify"],
+                           cwd=new_repo, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_merge_skills_lock_preserves_custom_and_handles_corrupt(self):
+        import install
+        tmp_dst = self.tmp / "test_skills.lock.json"
+        tmp_src = BUNDLE / "payload/.helm/skills.lock.json"
+
+        # 1. Empty / corrupt file handling
+        tmp_dst.write_text("")
+        self.assertTrue(install.merge_skills_lock(tmp_dst, tmp_src))
+        data = json.loads(tmp_dst.read_text())
+        self.assertEqual(len(data.get("skills", [])), 6)
+
+        # 2. Corrupt JSON
+        tmp_dst.write_text("{not valid json")
+        self.assertTrue(install.merge_skills_lock(tmp_dst, tmp_src))
+        data = json.loads(tmp_dst.read_text())
+        self.assertEqual(len(data.get("skills", [])), 6)
+
+        # 3. Preserves custom skills
+        custom_lock = {
+            "skills": [
+                {
+                    "name": "my-custom-skill",
+                    "source": "local:custom",
+                    "commit": "12345678",
+                    "license": "MIT",
+                    "reviewer": "me",
+                    "content_sha": "abc",
+                    "files": ["SKILL.md"],
+                    "has_scripts": False,
+                }
+            ]
+        }
+        tmp_dst.write_text(json.dumps(custom_lock))
+        self.assertTrue(install.merge_skills_lock(tmp_dst, tmp_src))
+        merged = json.loads(tmp_dst.read_text())
+        names = {s["name"] for s in merged["skills"]}
+        self.assertIn("my-custom-skill", names)
+        self.assertEqual(len(names), 7)
+
+    def test_skills_verify_detects_tamper_in_secondary_platform(self):
+        new_repo = self.tmp / "tamper_repo"
+        new_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=new_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=new_repo)
+        sh("git", "config", "user.name", "Dev", cwd=new_repo)
+        (new_repo / "app.py").write_text("print('test')\n")
+        sh("git", "add", ".", cwd=new_repo)
+        sh("git", "commit", "-qm", "init", cwd=new_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(new_repo))
+        sh(sys.executable, str(BUNDLE / "install.py"), str(new_repo), "--platform", "all", cwd=new_repo, env=repo_env)
+        # Tamper only in .agents/skills
+        target_file = new_repo / ".agents/skills/tanstack-query/SKILL.md"
+        with open(target_file, "a") as f:
+            f.write("\nTampered content\n")
+
+        r = subprocess.run([sys.executable, str(new_repo / ".helm/bin/helm"), "skills", "verify"],
+                           cwd=new_repo, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("HASH MISMATCH", r.stdout)
+
+    def test_skills_verify_flags_duplicate_in_lockfile(self):
+        lock_path = self.repo / ".helm/skills.lock.json"
+        data = json.loads(lock_path.read_text())
+        if data.get("skills"):
+            data["skills"].append(dict(data["skills"][0]))  # duplicate first skill
+        lock_path.write_text(json.dumps(data))
+        r = self.helm("skills", "verify", check=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("duplicate skill entry in lockfile", r.stdout)
+
+
+
 
 class TestTemplates(Base):
     def test_templates_validate_once_filled(self):

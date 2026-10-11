@@ -1,3 +1,100 @@
 {
-  "skills": []
+  "skills": [
+    {
+      "name": "fowler-code-craft",
+      "source": "local:gemini/skills/fowler-code-craft",
+      "commit": "b0f719e0",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "architecture,refactoring",
+      "content_sha": "7645f988bab16d41e2cdd9af530f5eee6e231cf561513f9243ce96b6a02962f6",
+      "files": [
+        "SKILL.md",
+        "examples/before-after-refactoring.md",
+        "references/code-smells-catalog.md",
+        "references/enterprise-patterns.md",
+        "references/naming-conventions.md",
+        "references/refactoring-patterns.md"
+      ],
+      "has_scripts": false
+    },
+    {
+      "name": "grill-with-docs",
+      "source": "https://github.com/mattpocock/skills",
+      "commit": "49dd158d",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "workflow,design",
+      "content_sha": "43244a25100c241698013aa79229567888ba376171bc85fcc6e0b28aa4d20233",
+      "files": [
+        "SKILL.md"
+      ],
+      "has_scripts": false
+    },
+    {
+      "name": "playwright-best-practices",
+      "source": "https://github.com/currents-dev/playwright-best-practices-skill",
+      "commit": "283d5cbc",
+      "license": "Apache-2.0",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "testing,e2e",
+      "content_sha": "5a6b508be0afd918855dcae868bc09cb80bb1f0ba59384f432f936529c7ff78c",
+      "files": [
+        "SKILL.md"
+      ],
+      "has_scripts": false
+    },
+    {
+      "name": "react-composition-patterns",
+      "source": "https://github.com/vercel-labs/agent-skills",
+      "commit": "063bee94",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "frontend,react19",
+      "content_sha": "768c0bba62b6cd45adae64525bac0f50da6a87b5031ffec76a70b01d319e4099",
+      "files": [
+        "SKILL.md",
+        "rules/architecture-avoid-boolean-props.md",
+        "rules/architecture-compound-components.md",
+        "rules/patterns-children-over-render-props.md",
+        "rules/patterns-explicit-variants.md",
+        "rules/react19-no-forwardref.md",
+        "rules/state-context-interface.md",
+        "rules/state-decouple-implementation.md"
+      ],
+      "has_scripts": false
+    },
+    {
+      "name": "tanstack-query",
+      "source": "https://github.com/DeckardGer/tanstack-agent-skills",
+      "commit": "b2fc14c9",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "frontend,data-fetching",
+      "content_sha": "d976835d603f5d1e3f21c63c579f4cfb704513fce119ea0b64d7e979b7a191a5",
+      "files": [
+        "SKILL.md"
+      ],
+      "has_scripts": false
+    },
+    {
+      "name": "vercel-react-best-practices",
+      "source": "https://github.com/vercel-labs/agent-skills",
+      "commit": "063bee94",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "frontend,react19,perf",
+      "content_sha": "45d654373932d040c614076715756b3c8f5b3fae8c62eab2585b70b6289f6c34",
+      "files": [
+        "SKILL.md"
+      ],
+      "has_scripts": false
+    }
+  ]
 }

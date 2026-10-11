@@ -135,37 +135,207 @@ def insert_block(agents: Path, block: str):
     agents.write_text(txt, encoding="utf-8")
 
 
+def merge_antigravity_hooks(dst: Path, src: Path):
+    ours = json.loads(src.read_text(encoding="utf-8"))
+    cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
+    cur["helm-guard"] = ours["helm-guard"]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+
+
+def merge_claude_settings(dst: Path, src: Path):
+    ours = json.loads(src.read_text(encoding="utf-8"))
+    cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
+    hooks = cur.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    kept = [e for e in pre if "helm_guard.py" not in e.get("command", "")]
+    hooks["PreToolUse"] = kept + ours["hooks"]["PreToolUse"]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+
+
+def merge_codex_hooks(dst: Path, src: Path):
+    ours = json.loads(src.read_text(encoding="utf-8"))
+    cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {"hooks": {}}
+    hooks = cur.setdefault("hooks", {})
+    pre = hooks.setdefault("PreToolUse", [])
+    kept = []
+    for entry in pre:
+        h_list = [h for h in entry.get("hooks", []) if "helm_guard.py" not in h.get("command", "")]
+        if h_list:
+            entry["hooks"] = h_list
+            kept.append(entry)
+    hooks["PreToolUse"] = kept + ours["hooks"]["PreToolUse"]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+
+
+def prompt_platform(repo: Path) -> list[str]:
+    has_ag = (repo / ".agents").exists()
+    has_cl = (repo / ".claude").exists()
+    has_cx = (repo / ".codex").exists()
+    has_cu = (repo / ".cursor").exists()
+
+    default_choice = "4"
+    if has_ag:
+        default_choice = "1"
+    elif has_cl:
+        default_choice = "2"
+    elif has_cx:
+        default_choice = "3"
+    elif has_cu:
+        default_choice = "4"
+
+    w = 68
+    border = "─" * w
+    print(ctext(f"\n┌{border}┐", "cyan"))
+    title = "  🔍 AI Platform Configuration"
+    print(ctext(f"│{title:<68}│", "bold"))
+    print(ctext(f"├{border}┤", "cyan"))
+    q1 = "  Which AI platform(s) would you like to configure HELM for?"
+    print(f"│{q1:<68}│")
+    op1 = f"  [1] Google Antigravity {'(detected .agents/)' if has_ag else ''}"
+    print(f"│{op1:<68}│")
+    op2 = f"  [2] Anthropic Claude Code {'(detected .claude/)' if has_cl else ''}"
+    print(f"│{op2:<68}│")
+    op3 = f"  [3] OpenAI Codex CLI {'(detected .codex/)' if has_cx else ''}"
+    print(f"│{op3:<68}│")
+    op4 = f"  [4] Cursor {'(detected .cursor/)' if has_cu else ''}"
+    print(f"│{op4:<68}│")
+    op5 = "  [5] Multi-Platform (All platforms)"
+    print(f"│{op5:<68}│")
+    print(ctext(f"└{border}┘", "cyan"))
+
+    try:
+        choice = prompt_user(f"\nSelect platform [1-5, default: {default_choice}]: ").strip() or default_choice
+    except (EOFError, KeyboardInterrupt):
+        choice = default_choice
+
+    mapping = {
+        "1": ["antigravity"],
+        "2": ["claude"],
+        "3": ["codex"],
+        "4": ["cursor"],
+        "5": ["antigravity", "claude", "codex", "cursor"],
+    }
+    selected = mapping.get(choice, ["antigravity" if has_ag else "cursor"])
+    print(ctext(f"  ✔ Configured for: {', '.join(selected)}\n", "green"))
+    return selected
+
+
+def get_platform_gitignores(platforms: list[str]) -> list[str]:
+    ignores = [
+        ".helm/",
+        "AGENTS.md",
+        "mcp_jira_config.json",
+        "__pycache__/",
+        "*.py[cod]",
+    ]
+    if "antigravity" in platforms:
+        ignores.append(".agents/")
+    if "claude" in platforms:
+        ignores.append(".claude/")
+    if "codex" in platforms:
+        ignores.append(".codex/")
+    if "cursor" in platforms:
+        ignores.extend([
+            ".cursor/agents/",
+            ".cursor/commands/",
+            ".cursor/skills/",
+            ".cursor/cli.json",
+            ".cursor/hooks.json",
+            ".cursor/mcp.json",
+        ])
+    return ignores
+
+
 def perform_repo_install(root: Path):
     bp = find_blueprint()
     if not bp:
         die("cannot locate HELM blueprint payload (check ~/.helm/blueprint)")
-    payload_dir = bp if (bp / ".helm").exists() else (bp.parent if (bp.parent / ".helm").exists() else bp)
+    if (bp / ".helm").exists():
+        payload_dir = bp
+    elif (bp / "payload/.helm").exists():
+        payload_dir = bp / "payload"
+    elif (bp.parent / ".helm").exists():
+        payload_dir = bp.parent
+    else:
+        payload_dir = bp
 
-    print(ctext(f"\nInitializing HELM into {root.name}...", "bold"))
+    platforms = prompt_platform(root) if is_interactive() else (
+        ["antigravity"] if (root / ".agents").exists() else (
+            ["claude"] if (root / ".claude").exists() else (
+                ["codex"] if (root / ".codex").exists() else ["cursor"]
+            )
+        )
+    )
+
+    print(ctext(f"\nInitializing HELM into {root.name} for {', '.join(platforms)}...", "bold"))
     for src in sorted(p for p in payload_dir.rglob("*") if p.is_file()):
         rel = src.relative_to(payload_dir).as_posix()
-        if rel == "AGENTS.helm.md" or rel.startswith(".cursor/skills/") or "__pycache__" in rel or rel.endswith(".pyc"):
+        if (rel == "AGENTS.helm.md" or
+            rel.startswith(".cursor/") or
+            rel.startswith(".agents/") or
+            rel.startswith(".claude/") or
+            rel.startswith(".codex/") or
+            "__pycache__" in rel or rel.endswith(".pyc")):
             continue
         dst = root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if rel == ".cursor/hooks.json":
-            merge_hooks(dst, src)
-        elif rel == ".cursor/cli.json":
-            merge_cli(dst, src)
-        elif rel == ".cursor/mcp.json":
-            merge_mcp(dst, src)
-        elif rel == ".helm/policy/policy.json" and dst.exists():
+        if rel == ".helm/policy/policy.json" and dst.exists():
             continue
-        else:
-            shutil.copy2(src, dst)
-    if not (root / ".cursor/mcp.json").exists():
-        merge_mcp(root / ".cursor/mcp.json", None)
+        shutil.copy2(src, dst)
+
+    if "cursor" in platforms:
+        for f in ("hooks.json", "cli.json", "mcp.json"):
+            src = payload_dir / ".cursor" / f
+            dst = root / ".cursor" / f
+            if f == "hooks.json" and src.exists():
+                merge_hooks(dst, src)
+            elif f == "cli.json" and src.exists():
+                merge_cli(dst, src)
+            elif f == "mcp.json":
+                merge_mcp(dst, src if src.exists() else None)
+        for sub in ("agents", "commands"):
+            s_dir = payload_dir / ".cursor" / sub
+            if s_dir.exists():
+                for sf in s_dir.glob("*"):
+                    df = root / ".cursor" / sub / sf.name
+                    df.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(sf, df)
+        (root / ".cursor/skills").mkdir(parents=True, exist_ok=True)
+        print(ctext("  ✔ Configured Cursor hooks and MCP template", "green"))
+
+    if "antigravity" in platforms:
+        src = payload_dir / ".agents/hooks.json"
+        if src.exists():
+            merge_antigravity_hooks(root / ".agents/hooks.json", src)
+        (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
+        print(ctext("  ✔ Configured Google Antigravity fail-closed hooks", "green"))
+
+    if "claude" in platforms:
+        src = payload_dir / ".claude/settings.json"
+        if src.exists():
+            merge_claude_settings(root / ".claude/settings.json", src)
+        (root / ".claude/skills").mkdir(parents=True, exist_ok=True)
+        print(ctext("  ✔ Configured Anthropic Claude Code hooks", "green"))
+
+    if "codex" in platforms:
+        src = payload_dir / ".codex/hooks.json"
+        if src.exists():
+            merge_codex_hooks(root / ".codex/hooks.json", src)
+        (root / ".codex/skills").mkdir(parents=True, exist_ok=True)
+        print(ctext("  ✔ Configured OpenAI Codex hooks", "green"))
+
     for f in ("helm", "helm_guard.py", "helm_lib.py"):
         p = root / ".helm/bin" / f
         if p.exists():
             os.chmod(p, 0o755)
-    print(ctext("  ✔ Installed agents, commands, templates, and security guard hooks", "green"))
-    print(ctext("  ✔ Initialized .cursor/mcp.json (Atlassian MCP configuration template)", "green"))
+
+    cfg_path = root / ".helm/config.json"
+    cfg = L.load_json(cfg_path, {})
+    cfg["platforms"] = platforms
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
     agents_src = payload_dir / "AGENTS.helm.md"
     if not agents_src.exists():
@@ -176,32 +346,17 @@ def perform_repo_install(root: Path):
 
     gi = root / ".gitignore"
     cur = gi.read_text(encoding="utf-8") if gi.exists() else ""
-    needed_gi = [
-        ".helm/",
-        ".cursor/agents/",
-        ".cursor/commands/",
-        ".cursor/skills/",
-        ".cursor/cli.json",
-        ".cursor/hooks.json",
-        ".cursor/mcp.json",
-        "AGENTS.md",
-        "mcp_jira_config.json",
-    ]
+    needed_gi = get_platform_gitignores(platforms)
     add = [l for l in needed_gi if l not in cur.splitlines()]
     if add:
-        gi.write_text(cur.rstrip("\n") + ("\n" if cur else "") + "# HELM framework & task artifacts\n" + "\n".join(add) + "\n", encoding="utf-8")
-        print(ctext("  ✔ Configured .gitignore for HELM framework & task artifacts", "green"))
+        gi.write_text(cur.rstrip("\n") + ("\n" if cur else "") + "# HELM local developer governance files\n" + "\n".join(add) + "\n", encoding="utf-8")
+        print(ctext("  ✔ Configured .gitignore for HELM local governance files", "green"))
 
     pol = L.load_policy(root)
     L.ensure_key()
     L.state_dir(root).mkdir(parents=True, exist_ok=True)
     L.integrity_refresh(root, pol)
     print(ctext("  ✔ Initialized HMAC signing key and integrity manifest", "green"))
-    has_mcp, _, _, missing_mcp, mcp_cfg_path = inspect_atlassian_mcp(root)
-    if not has_mcp:
-        print("\n  " + cwarn(f"Atlassian MCP in {mcp_cfg_path} requires credentials ({', '.join(missing_mcp)})."))
-        print(ctext(f"    • To connect Jira: set JIRA_URL, JIRA_USERNAME & JIRA_API_TOKEN in {mcp_cfg_path}", "dim"))
-        print(ctext("    • Or leave as-is to use manual/paste Local Story Mode (STORY.md).", "dim"))
     return pol
 
 
@@ -2287,22 +2442,39 @@ def active_skills_dir(root: Path) -> Path:
 
 
 def skills_verify(root, quiet=False):
+    root = Path(root).resolve()
     lock = L.load_json(root / ".helm/skills.lock.json", {"skills": []})
     problems, approved = [], {}
     s_dir = active_skills_dir(root)
+    cand_dirs = []
+    for cd in [s_dir, *[root / x for x in SKILL_DIRS]]:
+        if cd not in cand_dirs:
+            cand_dirs.append(cd)
+
+    seen_locked = set()
     for s in lock.get("skills", []):
-        d = None
-        for cand in [s_dir, *[root / x for x in SKILL_DIRS]]:
-            if (cand / s["name"]).exists():
-                d = cand / s["name"]
-                break
-        if d is None:
-            d = s_dir / s["name"]
-        approved[str(d)] = s
-        if not d.is_dir():
-            problems.append(f"approved skill missing on disk: {s['name']}")
-        elif folder_hash(d)[0] != s["content_sha"]:
-            problems.append(f"HASH MISMATCH (modified since approval): {s['name']}")
+        if not isinstance(s, dict) or "name" not in s:
+            continue
+        s_name = s["name"]
+        if s_name in seen_locked:
+            problems.append(f"duplicate skill entry in lockfile: {s_name}")
+            continue
+        seen_locked.add(s_name)
+
+        matched = []
+        for cand in cand_dirs:
+            cand_skill = cand / s_name
+            if cand_skill.exists() and str(cand_skill) not in approved:
+                matched.append(cand_skill)
+                approved[str(cand_skill)] = s
+                if not cand_skill.is_dir():
+                    problems.append(f"approved skill missing on disk: {s_name}")
+                elif folder_hash(cand_skill)[0] != s.get("content_sha"):
+                    problems.append(f"HASH MISMATCH (modified since approval): {s_name}")
+        if not matched:
+            d = s_dir / s_name
+            approved[str(d)] = s
+            problems.append(f"approved skill missing on disk: {s_name}")
     for path, (where, p) in discovered_skills(root).items():
         if path not in approved:
             problems.append(f"UNAPPROVED skill that AI agents will discover ({where}): {path}")

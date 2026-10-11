@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,61 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / "payload"
 BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
+
+
+def ctext(text: str, style: str) -> str:
+    if not (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")):
+        return text
+    codes = {
+        "bold": "\033[1m", "dim": "\033[2m", "cyan": "\033[36m",
+        "bold_cyan": "\033[1;36m", "green": "\033[32m", "bold_green": "\033[1;32m",
+        "blue": "\033[34m", "bold_blue": "\033[1;34m", "reset": "\033[0m"
+    }
+    return f"{codes.get(style, '')}{text}{codes['reset']}"
+
+
+def print_next_steps():
+    c_blue = ctext("", "bold_blue")[:7] if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+    c_green = ctext("", "bold_green")[:7] if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+    c_cyan = ctext("", "bold_cyan")[:7] if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+    c_bold = "\033[1m" if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+    c_dim = "\033[2m" if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+    c_reset = "\033[0m" if sys.stdout.isatty() or os.environ.get("FORCE_COLOR") else ""
+
+    w = 70
+    top = "┌" + "─" * w + "┐"
+    div = "├" + "─" * w + "┤"
+    bot = "└" + "─" * w + "┘"
+
+    def vlen(s):
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", s)
+        extra = sum(1 for ch in clean if ord(ch) > 0x2000)
+        return len(clean) + extra
+
+    lines = [
+        f"{c_blue}🚀 HELM Next Steps{c_reset}",
+        "---",
+        f"{c_green}✔{c_reset} {c_bold}Local-Only Governance{c_reset}: Framework files are gitignored.",
+        f"  {c_dim}Only your actual code changes will ever be committed.{c_reset}",
+        "",
+        f"{c_bold}1. Verify Live Agent Interception{c_reset} {c_dim}(proves hooks are active){c_reset}:",
+        f"   {c_cyan}$ .helm/bin/helm doctor --live{c_reset}",
+        "",
+        f"{c_bold}2. Put helm on your PATH{c_reset} {c_dim}(optional convenience){c_reset}:",
+        f"   {c_cyan}$ ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm{c_reset}",
+        "",
+        f"{c_bold}3. Start a governed engineering task{c_reset}:",
+        f"   {c_cyan}$ helm start <TASK_ID>{c_reset}",
+    ]
+
+    print("\n" + top)
+    for item in lines:
+        if item == "---":
+            print(div)
+        else:
+            pad = max(0, w - vlen(item) - 1)
+            print("│ " + item + (" " * pad) + "│")
+    print(bot + "\n")
 def get_platform_gitignores(platforms: list[str]) -> list[str]:
     ignores = [
         ".helm/",
@@ -344,19 +400,19 @@ def main():
         say(f".gitignore += {', '.join(add)}")
 
     env = dict(os.environ)
+    if sys.stdout.isatty():
+        env["FORCE_COLOR"] = "1"
     r = subprocess.run([sys.executable, str(repo / ".helm/bin/helm"), "init"], cwd=repo, env=env, capture_output=True, text=True)
     say(r.stdout.strip().splitlines()[0] if r.returncode == 0 else f"helm init FAILED: {r.stderr.strip()}")
-    r = subprocess.run([sys.executable, str(repo / ".helm/bin/helm"), "doctor"], cwd=repo, env=env, capture_output=True, text=True)
-    print("\n--- helm doctor ---\n" + r.stdout)
 
-    print("NEXT STEPS\n"
-          "  1. Framework files are gitignored for clean local workflows (zero codebase pollution).\n"
-          "     Only your actual source code changes will be committed to the repository.\n"
-          "  2. Configure Atlassian MCP credentials in .cursor/mcp.json if using Jira/Confluence\n"
-          "     or leave empty to use Local Story Mode (STORY.md).\n"
-          "  3. Put helm on your PATH:  ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm\n"
-          "  4. helm doctor --live        # proves hooks really fire through your AI runner (do not skip)\n"
-          "  5. helm start <TASK_ID>      # begin your governed engineering workflow")
+    print("\n" + ctext("--- helm doctor ---", "bold"))
+    if sys.stdout.isatty():
+        subprocess.run([sys.executable, str(repo / ".helm/bin/helm"), "doctor"], cwd=repo, env=env)
+    else:
+        r = subprocess.run([sys.executable, str(repo / ".helm/bin/helm"), "doctor"], cwd=repo, env=env, capture_output=True, text=True)
+        print(r.stdout)
+
+    print_next_steps()
 
     if sys.stdin.isatty() and sys.stdout.isatty():
         try:

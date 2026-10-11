@@ -26,8 +26,22 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import helm_guard as G  # noqa: E402
-import helm_lib as L  # noqa: E402
+try:
+    import helm_guard as G  # noqa: E402
+    import helm_lib as L  # noqa: E402
+except (ImportError, OSError):
+    import importlib.machinery
+    import importlib.util
+    _p = Path(__file__).resolve().parent
+    for _mod_name in ("helm_lib", "helm_guard"):
+        if _mod_name not in sys.modules:
+            _loader = importlib.machinery.SourceFileLoader(_mod_name, str(_p / f"{_mod_name}.py"))
+            _spec = importlib.util.spec_from_loader(_mod_name, _loader)
+            _m = importlib.util.module_from_spec(_spec)
+            sys.modules[_mod_name] = _m
+            _loader.exec_module(_m)
+    import helm_guard as G  # noqa: E402
+    import helm_lib as L  # noqa: E402
 
 GATE_PHASE = {"discovery": "AWAITING_DISCOVERY_APPROVAL", "plan": "AWAITING_PLAN_APPROVAL", "final": "AWAITING_FINAL_APPROVAL"}
 PRE_IMPL = {"DISCOVERY", "AWAITING_DISCOVERY_APPROVAL", "PLANNING", "AWAITING_PLAN_APPROVAL"}
@@ -69,8 +83,47 @@ def find_blueprint():
     return None
 
 
+def read_blueprint_bytes(p: Path) -> bytes:
+    try:
+        return p.read_bytes()
+    except OSError:
+        bundle_root = Path(__file__).resolve().parent.parent.parent.parent
+        rel = p.relative_to(bundle_root).as_posix()
+        res = subprocess.run(["git", "show", f":{rel}"], cwd=bundle_root, capture_output=True, check=True)
+        return res.stdout
+
+
+def read_blueprint_text(p: Path) -> str:
+    return read_blueprint_bytes(p).decode("utf-8")
+
+
+def copy_blueprint_file(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        dst.write_bytes(read_blueprint_bytes(src))
+
+
+def list_blueprint_files(base_dir: Path) -> list[Path]:
+    try:
+        files = [p for p in base_dir.rglob("*") if p.is_file()]
+    except OSError:
+        files = []
+    if not files:
+        try:
+            bundle_root = Path(__file__).resolve().parent.parent.parent.parent
+            rel_prefix = base_dir.relative_to(bundle_root).as_posix()
+            res = subprocess.run(["git", "ls-files", rel_prefix], cwd=bundle_root, capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout:
+                files = [bundle_root / line.strip() for line in res.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+    return sorted(files)
+
+
 def merge_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_blueprint_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "hooks": {}}
     cur.setdefault("version", 1)
     hooks = cur.setdefault("hooks", {})
@@ -97,7 +150,7 @@ DEFAULT_MCP_CONFIG = {
 
 
 def merge_cli(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_blueprint_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"permissions": {"allow": [], "deny": []}}
     cur.pop("version", None)
     perms = cur.setdefault("permissions", {})
@@ -108,7 +161,7 @@ def merge_cli(dst: Path, src: Path):
 
 
 def merge_mcp(dst: Path, src: Path | None = None):
-    ours = json.loads(src.read_text(encoding="utf-8")) if (src and src.exists()) else DEFAULT_MCP_CONFIG
+    ours = json.loads(read_blueprint_text(src)) if (src and src.exists()) else DEFAULT_MCP_CONFIG
     cur = L.load_json(dst, {}) if dst.exists() else {"mcpServers": {}}
     if not isinstance(cur, dict):
         cur = {"mcpServers": {}}
@@ -118,6 +171,32 @@ def merge_mcp(dst: Path, src: Path | None = None):
             servers[k] = v
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+
+
+def merge_skills_lock(dst: Path, src: Path) -> bool:
+    try:
+        ours = json.loads(read_blueprint_text(src)) if src.exists() else {"skills": []}
+    except Exception:
+        ours = {"skills": []}
+    try:
+        cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {"skills": []}
+    except Exception:
+        cur = {"skills": []}
+    if not isinstance(ours, dict) or not isinstance(ours.get("skills"), list):
+        ours = {"skills": []}
+    if not isinstance(cur, dict) or not isinstance(cur.get("skills"), list):
+        cur = {"skills": []}
+    existing_names = {s.get("name") for s in cur["skills"] if isinstance(s, dict) and "name" in s}
+    added = False
+    for s in ours.get("skills", []):
+        if isinstance(s, dict) and s.get("name") and s.get("name") not in existing_names:
+            cur["skills"].append(s)
+            existing_names.add(s["name"])
+            added = True
+    if added or not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+    return added
 
 
 def insert_block(agents: Path, block: str):
@@ -136,7 +215,7 @@ def insert_block(agents: Path, block: str):
 
 
 def merge_antigravity_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text(encoding="utf-8"))
+    ours = json.loads(read_blueprint_text(src))
     cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
     cur["helm-guard"] = ours["helm-guard"]
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -183,24 +262,37 @@ def ensure_antigravity_env(root: Path):
             pass
     else:
         bp = find_blueprint()
-        src_hooks = bp / ".agents/hooks.json" if bp else None
+        src_hooks = None
+        if bp:
+            for cand in [bp / ".agents/hooks.json", bp / "payload/.agents/hooks.json", bp.parent / ".agents/hooks.json", bp.parent / "payload/.agents/hooks.json"]:
+                if cand.exists():
+                    src_hooks = cand
+                    break
         if src_hooks and src_hooks.exists():
             merge_antigravity_hooks(hooks_file, src_hooks)
 
     bp = find_blueprint()
-    src_agents = (bp / ".agents") if (bp and (bp / ".agents").exists()) else (root / ".cursor/agents")
+    src_agents = None
+    if bp:
+        for cand in [bp / ".agents", bp / "payload/.agents", bp.parent / ".agents", bp.parent / "payload/.agents"]:
+            if cand.exists():
+                src_agents = cand
+                break
+    if not src_agents:
+        src_agents = root / ".cursor/agents"
     if src_agents and src_agents.exists():
-        for af in src_agents.glob("*.md"):
+        agent_files = list(src_agents.glob("*.md")) or [p for p in list_blueprint_files(src_agents) if p.suffix == ".md"]
+        for af in agent_files:
             df = ag_dir / af.name
             if not df.exists():
                 try:
-                    shutil.copy2(af, df)
+                    copy_blueprint_file(af, df)
                 except Exception:
                     pass
 
 
 def merge_claude_settings(dst: Path, src: Path):
-    ours = json.loads(src.read_text(encoding="utf-8"))
+    ours = json.loads(read_blueprint_text(src))
     cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {}
     hooks = cur.setdefault("hooks", {})
     pre = hooks.setdefault("PreToolUse", [])
@@ -211,7 +303,7 @@ def merge_claude_settings(dst: Path, src: Path):
 
 
 def merge_codex_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text(encoding="utf-8"))
+    ours = json.loads(read_blueprint_text(src))
     cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {"hooks": {}}
     hooks = cur.setdefault("hooks", {})
     pre = hooks.setdefault("PreToolUse", [])
@@ -305,7 +397,7 @@ def get_platform_gitignores(platforms: list[str]) -> list[str]:
     return ignores
 
 
-def perform_repo_install(root: Path):
+def perform_repo_install(root: Path, target_platforms: list[str] | None = None) -> dict:
     bp = find_blueprint()
     if not bp:
         die("cannot locate HELM blueprint payload (check ~/.helm/blueprint)")
@@ -325,7 +417,14 @@ def perform_repo_install(root: Path):
     detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu)] if has]
 
     cfg_p = root / ".helm/config.json"
-    platforms = L.load_json(cfg_p, {}).get("platforms") if cfg_p.exists() else None
+    platforms = None
+    if target_platforms:
+        if "all" in target_platforms:
+            platforms = ["antigravity", "claude", "codex", "cursor"]
+        else:
+            platforms = list(target_platforms)
+    elif cfg_p.exists():
+        platforms = L.load_json(cfg_p, {}).get("platforms")
 
     if not platforms:
         if len(detected) == 1:
@@ -336,7 +435,7 @@ def perform_repo_install(root: Path):
             platforms = detected or ["cursor"]
 
     print(ctext(f"\nInitializing HELM into {root.name} for {', '.join(platforms)}...", "bold"))
-    for src in sorted(p for p in payload_dir.rglob("*") if p.is_file()):
+    for src in list_blueprint_files(payload_dir):
         rel = src.relative_to(payload_dir).as_posix()
         if (rel == "AGENTS.helm.md" or
             rel.startswith(".cursor/") or
@@ -349,7 +448,10 @@ def perform_repo_install(root: Path):
         dst.parent.mkdir(parents=True, exist_ok=True)
         if rel == ".helm/policy/policy.json" and dst.exists():
             continue
-        shutil.copy2(src, dst)
+        if rel == ".helm/skills.lock.json" and dst.exists():
+            merge_skills_lock(dst, src)
+            continue
+        copy_blueprint_file(src, dst)
 
     if "cursor" in platforms:
         for f in ("hooks.json", "cli.json", "mcp.json"):
@@ -364,10 +466,10 @@ def perform_repo_install(root: Path):
         for sub in ("agents", "commands"):
             s_dir = payload_dir / ".cursor" / sub
             if s_dir.exists():
-                for sf in s_dir.glob("*"):
+                s_files = list(s_dir.glob("*")) or list_blueprint_files(s_dir)
+                for sf in s_files:
                     df = root / ".cursor" / sub / sf.name
-                    df.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(sf, df)
+                    copy_blueprint_file(sf, df)
         (root / ".cursor/skills").mkdir(parents=True, exist_ok=True)
         print(ctext("  ✔ Configured Cursor hooks and MCP template", "green"))
         print(ctext("  ✔ Initialized .cursor/mcp.json (Atlassian MCP configuration template)", "green"))
@@ -379,6 +481,10 @@ def perform_repo_install(root: Path):
             merge_antigravity_hooks(root / ".agents/hooks.json", src)
         (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
         ensure_antigravity_env(root)
+        ag_mcp = root / ".agents/mcp_config.json"
+        if not ag_mcp.exists() and not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
+            merge_mcp(ag_mcp, None)
+            print(ctext("  ✔ Initialized .agents/mcp_config.json (Atlassian MCP configuration template)", "green"))
         print(ctext("  ✔ Configured Google Antigravity fail-closed hooks and role definitions", "green"))
 
     if "claude" in platforms:
@@ -387,11 +493,12 @@ def perform_repo_install(root: Path):
             merge_claude_settings(root / ".claude/settings.json", src)
         (root / ".claude/skills").mkdir(parents=True, exist_ok=True)
         src_agents = payload_dir / ".claude/agents" if (payload_dir / ".claude/agents").exists() else payload_dir / ".cursor/agents"
-        for af in src_agents.glob("*.md"):
+        cl_files = list(src_agents.glob("*.md")) or [p for p in list_blueprint_files(src_agents) if p.suffix == ".md"]
+        for af in cl_files:
             df = root / ".claude/agents" / af.name
             df.parent.mkdir(parents=True, exist_ok=True)
             if not df.exists():
-                shutil.copy2(af, df)
+                copy_blueprint_file(af, df)
         print(ctext("  ✔ Configured Anthropic Claude Code hooks and role definitions", "green"))
 
     if "codex" in platforms:
@@ -400,12 +507,36 @@ def perform_repo_install(root: Path):
             merge_codex_hooks(root / ".codex/hooks.json", src)
         (root / ".codex/skills").mkdir(parents=True, exist_ok=True)
         src_agents = payload_dir / ".codex/agents" if (payload_dir / ".codex/agents").exists() else payload_dir / ".cursor/agents"
-        for af in src_agents.glob("*.md"):
+        cx_files = list(src_agents.glob("*.md")) or [p for p in list_blueprint_files(src_agents) if p.suffix == ".md"]
+        for af in cx_files:
             df = root / ".codex/agents" / af.name
             df.parent.mkdir(parents=True, exist_ok=True)
             if not df.exists():
-                shutil.copy2(af, df)
+                copy_blueprint_file(af, df)
         print(ctext("  ✔ Configured OpenAI Codex hooks and role definitions", "green"))
+
+    bundled_skills_src = payload_dir / ".cursor/skills"
+    if bundled_skills_src.exists():
+        for sf in list_blueprint_files(bundled_skills_src):
+            rel_in_skills = sf.relative_to(bundled_skills_src).as_posix()
+            if ".DS_Store" in rel_in_skills or "__pycache__" in rel_in_skills or rel_in_skills.endswith(".pyc"):
+                continue
+            for p_name in platforms:
+                if p_name == "cursor":
+                    target_f = root / ".cursor/skills" / rel_in_skills
+                elif p_name == "antigravity":
+                    target_f = root / ".agents/skills" / rel_in_skills
+                elif p_name == "claude":
+                    target_f = root / ".claude/skills" / rel_in_skills
+                elif p_name == "codex":
+                    target_f = root / ".codex/skills" / rel_in_skills
+                else:
+                    continue
+                if not target_f.exists():
+                    try:
+                        copy_blueprint_file(sf, target_f)
+                    except Exception:
+                        pass
 
     for f in ("helm", "helm_guard.py", "helm_lib.py"):
         p = root / ".helm/bin" / f
@@ -421,7 +552,7 @@ def perform_repo_install(root: Path):
     if not agents_src.exists():
         agents_src = bp / "AGENTS.helm.md"
     if agents_src.exists():
-        insert_block(root / "AGENTS.md", agents_src.read_text(encoding="utf-8"))
+        insert_block(root / "AGENTS.md", read_blueprint_text(agents_src))
         print(ctext("  ✔ Configured AI governance constitution (AGENTS.md)", "green"))
 
     gi = root / ".gitignore"
@@ -595,20 +726,39 @@ def is_mcp_placeholder(val: str | None) -> bool:
     return any(p in v for p in ("<your_", "your_", "your-", "insert_", "todo", "example", "placeholder", "xxx"))
 
 
-def inspect_atlassian_mcp(root):
+def inspect_atlassian_mcp(root, platforms=None):
     """Inspect .cursor/mcp.json and ~/.cursor/mcp.json for Atlassian/Jira MCP config.
     Returns (connected: bool, server_name: str|None, spec: dict|None, missing_fields: list[str], cfg_path: str).
     """
+    if platforms is None and root is not None and (root / ".helm/config.json").exists():
+        platforms = L.load_json(root / ".helm/config.json", {}).get("platforms")
+
     found_server = False
     missing_fields = []
-    cfg_path_str = ".cursor/mcp.json"
-    for f in (root / ".cursor/mcp.json", Path.home() / ".cursor/mcp.json"):
+    default_cfg = ".agents/mcp_config.json" if (platforms and "antigravity" in platforms and "cursor" not in platforms) else ".cursor/mcp.json"
+    cfg_path_str = default_cfg
+
+    candidates = []
+    if not platforms or "cursor" in platforms:
+        candidates.append(root / ".cursor/mcp.json")
+    if platforms and "antigravity" in platforms:
+        candidates.append(root / ".agents/mcp_config.json")
+    if not candidates:
+        candidates.append(root / ".cursor/mcp.json")
+    candidates.append(Path.home() / ".cursor/mcp.json")
+
+    for f in candidates:
+        if not f.exists():
+            continue
         cfg = L.load_json(f, {}) or {}
         servers = cfg.get("mcpServers", {})
         for name, spec in servers.items():
             if "atlassian" in name.lower() or "jira" in name.lower():
                 found_server = True
-                cfg_path_str = ".cursor/mcp.json" if f == root / ".cursor/mcp.json" else "~/.cursor/mcp.json"
+                try:
+                    cfg_path_str = str(f.relative_to(root))
+                except ValueError:
+                    cfg_path_str = "~/.cursor/mcp.json"
                 env = spec.get("env", {}) if isinstance(spec, dict) else {}
                 url = env.get("JIRA_URL") or os.environ.get("JIRA_URL")
                 token = env.get("JIRA_API_TOKEN") or os.environ.get("JIRA_API_TOKEN")
@@ -1195,7 +1345,55 @@ def cmd_init(a):
 
 
 def cmd_start(a):
-    root, pol = ctx()
+    root = L.find_root()
+    if not root:
+        die("not inside a git repository")
+
+    # -------------------------------------------------------------------------
+    # 0. Platform Resolution & Auto-Initialization
+    # -------------------------------------------------------------------------
+    req_plat = None
+    if getattr(a, "platform_ag", False):
+        req_plat = "antigravity"
+    elif getattr(a, "platform", None):
+        req_plat = a.platform
+
+    if req_plat:
+        target_platforms = ["antigravity", "claude", "codex", "cursor"] if req_plat == "all" else [req_plat]
+    else:
+        target_platforms = None
+
+    cfg_p = root / ".helm/config.json"
+    is_fresh = False
+    try:
+        pol = L.load_policy(root)
+    except L.PolicyError:
+        is_fresh = True
+        pol = None
+
+    if is_fresh:
+        # Fresh repo: default directly to cursor (zero prompts) unless target_platforms specified
+        platforms = target_platforms or ["cursor"]
+        pol = perform_repo_install(root, target_platforms=platforms)
+    elif target_platforms is not None:
+        # Initialized repo, explicitly configuring / switching platform
+        platforms = target_platforms
+        pol = perform_repo_install(root, target_platforms=platforms)
+    else:
+        # Initialized repo without --platform: detect from .helm/config.json immediately without prompting
+        cfg = L.load_json(cfg_p, {}) if cfg_p.exists() else {}
+        platforms = cfg.get("platforms")
+        if isinstance(platforms, str):
+            platforms = [platforms]
+        if not platforms:
+            has_ag = (root / ".agents").exists()
+            has_cl = (root / ".claude").exists()
+            has_cx = (root / ".codex").exists()
+            has_cu = (root / ".cursor").exists()
+            detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu)] if has]
+            platforms = detected or ["cursor"]
+            cfg["platforms"] = platforms
+            cfg_p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
     # -------------------------------------------------------------------------
     # 1. Pre-flight Auto-Initialization (Keys, State dir, Gitignore, Manifest)
@@ -1208,27 +1406,28 @@ def cmd_start(a):
     gi = root / ".gitignore"
     cur_gi = gi.read_text(encoding="utf-8") if gi.exists() else ""
     gi_lines = cur_gi.splitlines()
-    needed_gi = [
-        ".helm/",
-        ".cursor/agents/",
-        ".cursor/commands/",
-        ".cursor/skills/",
-        ".cursor/cli.json",
-        ".cursor/hooks.json",
-        ".cursor/mcp.json",
-        "AGENTS.md",
-        "mcp_jira_config.json",
-    ]
+    needed_gi = get_platform_gitignores(platforms)
     to_add_gi = [entry for entry in needed_gi if entry not in gi_lines]
     if to_add_gi:
         gi_content = cur_gi.rstrip("\n") + ("\n" if cur_gi else "") + "# HELM framework & task artifacts\n" + "\n".join(to_add_gi) + "\n"
         gi.write_text(gi_content, encoding="utf-8")
         print(ctext(f"  ✔ Configured .gitignore ({len(to_add_gi)} entries added)", "green"))
 
-    if not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
-        merge_mcp(root / ".cursor/mcp.json", None)
-        L.integrity_refresh(root, pol)
-        print(ctext("  ✔ Initialized .cursor/mcp.json (Atlassian MCP configuration template)", "green"))
+    if "cursor" in platforms:
+        if not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
+            merge_mcp(root / ".cursor/mcp.json", None)
+            L.integrity_refresh(root, pol)
+            print(ctext("  ✔ Initialized .cursor/mcp.json (Atlassian MCP configuration template)", "green"))
+
+    if "antigravity" in platforms:
+        ag_mcp = root / ".agents/mcp_config.json"
+        if not ag_mcp.exists() and not (root / ".cursor/mcp.json").exists() and not (Path.home() / ".cursor/mcp.json").exists():
+            merge_mcp(ag_mcp, None)
+            L.integrity_refresh(root, pol)
+            print(ctext("  ✔ Initialized .agents/mcp_config.json (Atlassian MCP configuration template)", "green"))
+
+    if "antigravity" in platforms or (root / ".agents").exists():
+        ensure_antigravity_env(root)
 
     if not L.integrity_path(root).exists():
         L.integrity_refresh(root, pol)
@@ -1321,7 +1520,7 @@ def cmd_start(a):
     # -------------------------------------------------------------------------
     # 4. Context & Ticket Gathering (Atlassian MCP & Task ID Prompts)
     # -------------------------------------------------------------------------
-    has_mcp, mcp_name, mcp_spec, missing_mcp, mcp_cfg_path = inspect_atlassian_mcp(root)
+    has_mcp, mcp_name, mcp_spec, missing_mcp, mcp_cfg_path = inspect_atlassian_mcp(root, platforms)
     story_input = None
     if has_mcp:
         clean_name = re.sub(r"[^\w\-.]", "", str(mcp_name))
@@ -1502,7 +1701,14 @@ def cmd_start(a):
     if story_input:
         print(ctext(f"  • Story File    : {L.WORK_REL}/{a.id}/STORY.md", "dim"))
     print("\n" + ctext("👉 Next Step (AI Agent Turn):", "bold"))
-    print(f"   Run " + ctext("helm work", "cyan") + " (or in Cursor IDE: " + ctext(f"/work {a.id}", "cyan") + ")")
+    if "antigravity" in platforms and "cursor" not in platforms:
+        print(f"   Run " + ctext("helm work", "cyan") + " (or trigger Antigravity agent: " + ctext(f"helm work {a.id}", "cyan") + ")")
+    elif "claude" in platforms and "cursor" not in platforms:
+        print(f"   Run " + ctext("helm work", "cyan") + " (or in Claude Code: " + ctext(f"helm work {a.id}", "cyan") + ")")
+    elif "codex" in platforms and "cursor" not in platforms:
+        print(f"   Run " + ctext("helm work", "cyan") + " (or in Codex: " + ctext(f"helm work {a.id}", "cyan") + ")")
+    else:
+        print(f"   Run " + ctext("helm work", "cyan") + " (or in Cursor IDE: " + ctext(f"/work {a.id}", "cyan") + ")")
     print(ctext("   (The AI agent will inspect the task and draft WORK.md for your approval.)\n", "dim"))
 
 
@@ -2993,6 +3199,8 @@ def main():
     s.add_argument("--tier", type=int, choices=[1, 2], default=None, help="Workflow tier (1: Quick, 2: Standard)")
     s.add_argument("--allow-dirty", action="store_true", help="Allow starting with uncommitted changes")
     s.add_argument("--story", default=None, help="Story or requirements description")
+    s.add_argument("--platform", choices=["cursor", "antigravity", "claude", "codex", "all"], default=None, help="Target AI agent platform")
+    s.add_argument("--ag", dest="platform_ag", action="store_true", help="Shortcut for --platform antigravity")
     s.set_defaults(f=cmd_start)
 
     s = sp.add_parser("work", help="Dispatch discovery procedure / start task work")

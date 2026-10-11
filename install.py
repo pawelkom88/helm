@@ -24,6 +24,28 @@ PAYLOAD = HERE / "payload"
 BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
 
 
+def read_payload_bytes(p: Path) -> bytes:
+    try:
+        return p.read_bytes()
+    except OSError:
+        rel = p.relative_to(HERE).as_posix()
+        res = subprocess.run(["git", "show", f":{rel}"], cwd=HERE, capture_output=True, check=True)
+        return res.stdout
+
+
+def read_payload_text(p: Path) -> str:
+    return read_payload_bytes(p).decode("utf-8")
+
+
+def copy_payload_file(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(src, dst)
+    except OSError:
+        data = read_payload_bytes(src)
+        dst.write_bytes(data)
+
+
 def ctext(text: str, style: str) -> str:
     if not (sys.stdout.isatty() or os.environ.get("FORCE_COLOR")):
         return text
@@ -113,7 +135,7 @@ def say(msg):
 
 def merge_skills_lock(dst: Path, src: Path) -> bool:
     try:
-        ours = json.loads(src.read_text()) if src.exists() else {"skills": []}
+        ours = json.loads(read_payload_text(src)) if src.exists() else {"skills": []}
     except Exception:
         ours = {"skills": []}
     try:
@@ -138,7 +160,7 @@ def merge_skills_lock(dst: Path, src: Path) -> bool:
 
 
 def merge_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "hooks": {}}
     cur.setdefault("version", 1)
     hooks = cur.setdefault("hooks", {})
@@ -150,7 +172,7 @@ def merge_hooks(dst: Path, src: Path):
 
 
 def merge_cli(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"permissions": {"allow": [], "deny": []}}
     cur.pop("version", None)
     perms = cur.setdefault("permissions", {})
@@ -161,7 +183,7 @@ def merge_cli(dst: Path, src: Path):
 
 
 def merge_mcp(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"mcpServers": {}}
     servers = cur.setdefault("mcpServers", {})
     for k, v in ours.get("mcpServers", {}).items():
@@ -172,7 +194,7 @@ def merge_mcp(dst: Path, src: Path):
 
 
 def merge_antigravity_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {}
     cur["helm-guard"] = ours["helm-guard"]
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +202,7 @@ def merge_antigravity_hooks(dst: Path, src: Path):
 
 
 def merge_claude_settings(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {}
     hooks = cur.setdefault("hooks", {})
     pre = hooks.setdefault("PreToolUse", [])
@@ -191,7 +213,7 @@ def merge_claude_settings(dst: Path, src: Path):
 
 
 def merge_codex_hooks(dst: Path, src: Path):
-    ours = json.loads(src.read_text())
+    ours = json.loads(read_payload_text(src))
     cur = json.loads(dst.read_text()) if dst.exists() else {"hooks": {}}
     hooks = cur.setdefault("hooks", {})
     pre = hooks.setdefault("PreToolUse", [])
@@ -279,13 +301,24 @@ def print_system_hooks():
 def setup_global():
     PAYLOAD_DST = Path.home() / ".helm/blueprint"
     PAYLOAD_DST.mkdir(parents=True, exist_ok=True)
-    for src in sorted(p for p in PAYLOAD.rglob("*") if p.is_file()):
+    try:
+        payload_files = [p for p in PAYLOAD.rglob("*") if p.is_file()]
+    except OSError:
+        payload_files = []
+    if not payload_files:
+        try:
+            res = subprocess.run(["git", "ls-files", "payload"], cwd=HERE, capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout:
+                payload_files = [HERE / line.strip() for line in res.stdout.splitlines() if line.strip() and (HERE / line.strip()).is_file()]
+        except Exception:
+            pass
+
+    for src in sorted(payload_files):
         rel = src.relative_to(PAYLOAD).as_posix()
         if "__pycache__" in rel or rel.endswith(".pyc"):
             continue
         dst = PAYLOAD_DST / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        copy_payload_file(src, dst)
     for f in ("helm", "helm_guard.py", "helm_lib.py"):
         p = PAYLOAD_DST / ".helm/bin" / f
         if p.exists():
@@ -314,9 +347,12 @@ def main():
     ap.add_argument("repo", nargs="?")
     ap.add_argument("--global", dest="global_install", action="store_true", help="Install HELM globally so 'helm' works everywhere")
     ap.add_argument("--platform", choices=["antigravity", "claude", "codex", "cursor", "all"], help="Target AI agent platform")
+    ap.add_argument("--ag", dest="platform_ag", action="store_true", help="Shortcut for --platform antigravity")
     ap.add_argument("--reset-policy", action="store_true")
     ap.add_argument("--print-system-hooks", action="store_true")
     a = ap.parse_args()
+    if a.platform_ag:
+        a.platform = "antigravity"
     if a.print_system_hooks:
         return print_system_hooks()
     if a.global_install:
@@ -351,7 +387,19 @@ def main():
         if (repo / ".cursor").exists() or not platforms:
             platforms.append("cursor")
 
-    for src in sorted(p for p in PAYLOAD.rglob("*") if p.is_file()):
+    try:
+        payload_files = [p for p in PAYLOAD.rglob("*") if p.is_file()]
+    except OSError:
+        payload_files = []
+    if not payload_files:
+        try:
+            res = subprocess.run(["git", "ls-files", "payload"], cwd=HERE, capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout:
+                payload_files = [HERE / line.strip() for line in res.stdout.splitlines() if line.strip() and (HERE / line.strip()).is_file()]
+        except Exception:
+            pass
+
+    for src in sorted(payload_files):
         rel = src.relative_to(PAYLOAD).as_posix()
         if rel == "AGENTS.helm.md" or "__pycache__" in rel or rel.endswith(".pyc"):
             continue
@@ -407,11 +455,11 @@ def main():
                 say("merged .helm/skills.lock.json (bundled skills registered)")
         elif rel in KEEP_IF_EXISTS and dst.exists():
             continue
-        elif rel == ".helm/policy/policy.json" and dst.exists() and dst.read_bytes() != src.read_bytes() and not a.reset_policy:
-            shutil.copy2(src, dst.with_name("policy.json.new"))
+        elif rel == ".helm/policy/policy.json" and dst.exists() and dst.read_bytes() != read_payload_bytes(src) and not a.reset_policy:
+            copy_payload_file(src, dst.with_name("policy.json.new"))
             say("policy.json differs from the new default → wrote policy.json.new (diff and merge by hand, or --reset-policy)")
         else:
-            shutil.copy2(src, dst)
+            copy_payload_file(src, dst)
 
     # Ensure skill directories exist for active platforms
     platform_skills_dirs = []
@@ -436,13 +484,34 @@ def main():
     bundled_skills_src = PAYLOAD / ".cursor/skills"
     if bundled_skills_src.exists():
         copied_skills = set()
-        for s_dir in sorted(bundled_skills_src.iterdir()):
-            if not s_dir.is_dir():
-                continue
+        skill_dirs = []
+        try:
+            skill_dirs = [s for s in sorted(bundled_skills_src.iterdir()) if s.is_dir()]
+        except OSError:
+            try:
+                res = subprocess.run(["git", "ls-files", "payload/.cursor/skills"], cwd=HERE, capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout:
+                    s_names = {line.strip().split("/")[3] for line in res.stdout.splitlines() if line.strip().startswith("payload/.cursor/skills/") and len(line.strip().split("/")) > 3}
+                    skill_dirs = [bundled_skills_src / name for name in sorted(s_names)]
+            except Exception:
+                pass
+
+        for s_dir in skill_dirs:
             for p_dir in platform_skills_dirs:
                 target_skill = p_dir / s_dir.name
                 if not target_skill.exists():
-                    shutil.copytree(s_dir, target_skill, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc"))
+                    try:
+                        shutil.copytree(s_dir, target_skill, ignore=shutil.ignore_patterns(".DS_Store", "__pycache__", "*.pyc"))
+                    except OSError:
+                        res = subprocess.run(["git", "ls-files", f"payload/.cursor/skills/{s_dir.name}"], cwd=HERE, capture_output=True, text=True)
+                        if res.returncode == 0 and res.stdout:
+                            for f in res.stdout.splitlines():
+                                f = f.strip()
+                                if f:
+                                    rel_in_skill = f[len(f"payload/.cursor/skills/{s_dir.name}/"):]
+                                    dst_f = target_skill / rel_in_skill
+                                    dst_f.parent.mkdir(parents=True, exist_ok=True)
+                                    copy_payload_file(HERE / f, dst_f)
                     copied_skills.add(s_dir.name)
         if copied_skills:
             say(f"copied bundled skills to active platform(s): {', '.join(sorted(copied_skills))}")
@@ -457,7 +526,7 @@ def main():
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
     say(f"configured platform(s): {', '.join(platforms)}")
 
-    insert_block(repo / "AGENTS.md", (PAYLOAD / "AGENTS.helm.md").read_text())
+    insert_block(repo / "AGENTS.md", read_payload_text(PAYLOAD / "AGENTS.helm.md"))
     say("AGENTS.md: HELM constitution block inserted/updated between markers")
 
     gi = repo / ".gitignore"

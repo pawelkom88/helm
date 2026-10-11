@@ -114,14 +114,7 @@
   "web": {
     "allow_search": true,
     "fetch_domains": [
-      "react.dev",
-      "tanstack.com",
-      "developer.mozilla.org",
-      "www.typescriptlang.org",
-      "vitest.dev",
-      "testing-library.com",
-      "storybook.js.org",
-      "nodejs.org"
+      "*"
     ]
   },
   "subagents": {

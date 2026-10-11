@@ -251,6 +251,11 @@ def static_prefix(g: str) -> str:
 
 
 ALLOWED_VIRTUAL_DEVICES = {"/dev/null", "/dev/stdout", "/dev/stderr"}
+_RESOLVED_ALLOWED_DEVICES = {
+    "/dev/null", "/dev/stdout", "/dev/stderr",
+    "/dev/fd/1", "/dev/fd/2",
+    "/proc/self/fd/1", "/proc/self/fd/2",
+}
 
 
 def is_tmp(q: Path) -> bool:
@@ -259,7 +264,7 @@ def is_tmp(q: Path) -> bool:
     resolved_tmp = Path(tmp).resolve().as_posix().rstrip("/")
     resolved_slash_tmp = Path("/tmp").resolve().as_posix().rstrip("/")
     return (s.startswith("/tmp/") or s.startswith("/private/tmp/") or
-            s in ALLOWED_VIRTUAL_DEVICES or s in {"/dev/fd/1", "/dev/fd/2"} or
+            s in _RESOLVED_ALLOWED_DEVICES or
             (bool(tmp) and s.startswith(tmp + "/")) or
             (bool(resolved_tmp) and s.startswith(resolved_tmp + "/")) or
             (bool(resolved_slash_tmp) and s.startswith(resolved_slash_tmp + "/")))
@@ -267,6 +272,11 @@ def is_tmp(q: Path) -> bool:
 
 def classify(root, pol, q: Path) -> dict:
     root = Path(root)
+    if str(q).startswith("~"):
+        try:
+            q = Path(expand(str(q))).resolve()
+        except Exception:
+            q = Path(expand(str(q)))
     try:
         rel = q.relative_to(root).as_posix()
     except ValueError:

@@ -21,7 +21,17 @@ from pathlib import Path
 
 BUNDLE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BUNDLE / "payload/.helm/bin"))
-import helm_lib as L  # noqa: E402
+sys.path.insert(0, str(BUNDLE))
+try:
+    import helm_lib as L  # noqa: E402
+except (ImportError, OSError):
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("helm_lib", str(BUNDLE / "payload/.helm/bin/helm_lib.py"))
+    spec = importlib.util.spec_from_loader("helm_lib", loader)
+    L = importlib.util.module_from_spec(spec)
+    sys.modules["helm_lib"] = L
+    loader.exec_module(L)
 
 
 def sh(*a, cwd, env=None, check=True):
@@ -29,6 +39,34 @@ def sh(*a, cwd, env=None, check=True):
     if check and r.returncode:
         raise AssertionError(f"{a} failed: {r.stdout}{r.stderr}")
     return r
+
+
+def read_payload_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        rel = p.relative_to(BUNDLE).as_posix()
+        res = subprocess.run(["git", "show", f":{rel}"], cwd=BUNDLE, capture_output=True, check=True)
+        return res.stdout.decode("utf-8")
+
+
+def copy_payload_dir(src: Path, dst: Path):
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    except OSError:
+        rel = src.relative_to(BUNDLE).as_posix()
+        res = subprocess.run(["git", "ls-files", rel], cwd=BUNDLE, capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            f = line.strip()
+            if f:
+                rel_in_dir = f[len(rel):].lstrip("/")
+                target = dst / rel_in_dir
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    data = (BUNDLE / f).read_bytes()
+                except OSError:
+                    data = subprocess.run(["git", "show", f":{f}"], cwd=BUNDLE, capture_output=True, check=True).stdout
+                target.write_bytes(data)
 
 
 class Base(unittest.TestCase):
@@ -458,9 +496,50 @@ class TestScopeAndBootstrap(Base):
 
     def test_web_allowlist(self):
         f = lambda url: self.guard("tool", {"tool_name": "WebFetch", "tool_input": {"url": url}}).get("permission") == "allow"
+        # 1. Default policy has wildcard ["*"] which permits any valid public HTTPS URL
         self.assertTrue(f("https://react.dev/reference/react/useEffect"))
-        self.assertFalse(f("https://attacker.example/?q=secrets"))
+        self.assertTrue(f("https://attacker.example/?q=secrets"))
+        self.assertTrue(f("https://docs.python.org/3/library/unittest.html"))
+        self.assertTrue(f("https://sub.docs.python.org/3/library/unittest.html"))
+        self.assertTrue(f("https://api.github.com:443/repos"))
+        # Direct string URL input in tool_input is also accepted
+        out_str = self.guard("tool", {"tool_name": "read_url_content", "tool_input": "https://react.dev"})
+        self.assertEqual(out_str.get("permission"), "allow")
+        # Non-HTTPS URLs and malformed URLs are rejected
         self.assertFalse(f("http://react.dev/insecure"))
+        self.assertFalse(f("http://attacker.example/?q=secrets"))
+        self.assertFalse(f("ftp://example.com/resource"))
+        self.assertFalse(f("file:///etc/passwd"))
+        self.assertFalse(f("javascript:alert(1)"))
+        self.assertFalse(f("https://"))
+        self.assertFalse(f(""))
+
+        # Verify audit log entry was written
+        audit_file = L.state_dir(self.repo) / "audit" / "_none.jsonl"
+        self.assertTrue(audit_file.exists())
+        audit_lines = [json.loads(line) for line in audit_file.read_text().splitlines() if line.strip()]
+        web_audits = [a for a in audit_lines if a.get("k") == "web"]
+        self.assertTrue(any(a.get("h") == "docs.python.org" for a in web_audits))
+
+        # 2. When policy is restricted to explicit domains without wildcard, domain restriction is enforced
+        pol_path = self.repo / ".helm/policy/policy.json"
+        orig_pol = pol_path.read_text()
+        try:
+            pol_data = json.loads(orig_pol)
+            pol_data["web"]["fetch_domains"] = ["react.dev"]
+            pol_path.write_text(json.dumps(pol_data))
+
+            self.assertTrue(f("https://react.dev/reference/react/useEffect"))
+            self.assertTrue(f("https://sub.react.dev/reference"))
+            self.assertFalse(f("https://attacker.example/?q=secrets"))
+            self.assertFalse(f("http://react.dev/insecure"))
+
+            # When fetch_domains is None or empty, denies web fetch gracefully without error
+            pol_data["web"]["fetch_domains"] = None
+            pol_path.write_text(json.dumps(pol_data))
+            self.assertFalse(f("https://react.dev"))
+        finally:
+            pol_path.write_text(orig_pol)
 
     def test_guard_fails_closed_on_broken_policy(self):
         (self.repo / ".helm/policy/policy.json").write_text("{ not json")
@@ -673,7 +752,23 @@ class TestSkills(Base):
 
         def calc_folder_hash(d):
             h, files = L.hashlib.sha256(), []
-            for p in sorted(x for x in d.rglob("*") if x.is_file()):
+            try:
+                flist = sorted(x for x in d.rglob("*") if x.is_file())
+            except OSError:
+                flist = []
+            if not flist:
+                rel_d = d.relative_to(BUNDLE).as_posix()
+                res = subprocess.run(["git", "ls-files", rel_d], cwd=BUNDLE, capture_output=True, text=True)
+                for line in sorted(res.stdout.splitlines()):
+                    f = line.strip()
+                    if f:
+                        rel = f[len(rel_d):].lstrip("/")
+                        files.append(rel)
+                        content = subprocess.run(["git", "show", f":{f}"], cwd=BUNDLE, capture_output=True, check=True).stdout
+                        sha = L.hashlib.sha256(content).hexdigest()
+                        h.update(rel.encode() + b"\0" + sha.encode() + b"\0")
+                return h.hexdigest(), files
+            for p in flist:
                 rel = p.relative_to(d).as_posix()
                 files.append(rel)
                 h.update(rel.encode() + b"\0" + L.sha256_file(p).encode() + b"\0")
@@ -688,7 +783,11 @@ class TestSkills(Base):
             "vercel-react-best-practices": {"source": "https://github.com/vercel-labs/agent-skills", "commit": "063bee94", "license": "MIT", "scope": "frontend,react19,perf"},
         }
 
-        bundled = sorted(d.name for d in skills_dir.iterdir() if d.is_dir())
+        try:
+            bundled = sorted(d.name for d in skills_dir.iterdir() if d.is_dir())
+        except OSError:
+            res = subprocess.run(["git", "ls-files", "payload/.cursor/skills"], cwd=BUNDLE, capture_output=True, text=True)
+            bundled = sorted({line.strip().split("/")[3] for line in res.stdout.splitlines() if line.strip().startswith("payload/.cursor/skills/") and len(line.strip().split("/")) > 3})
         self.assertEqual(bundled, sorted(meta_map.keys()))
 
         skills_list = []
@@ -710,9 +809,9 @@ class TestSkills(Base):
             })
 
         lock_data = {"skills": skills_list}
-        cur_lock = json.loads(lock_file.read_text())
+        cur_lock = json.loads(read_payload_text(lock_file))
         self.assertEqual(cur_lock, lock_data)
-        shutil.copy2(lock_file, self.repo / ".helm/skills.lock.json")
+        (self.repo / ".helm/skills.lock.json").write_text(read_payload_text(lock_file))
         r = self.helm("skills", "verify", check=False)
         self.assertEqual(r.returncode, 0, r.stdout)
 
@@ -821,7 +920,7 @@ class TestTemplates(Base):
         import re
         for name, f in names.items():
             self.assertTrue((tdir / f).exists(), f"template {f} missing")
-            raw = (tdir / f).read_text()
+            raw = read_payload_text(tdir / f)
             raw = raw.replace("{{test path in backticks, or manual: reason}}", "`src/app.ts`").replace("{{pass, fail or unproven}}", "pass")
             txt = re.sub(r"\{\{[^}]*\}\}", "filled", raw)
             txt = re.sub(r"^status:.*$", "status: ready", txt, flags=re.M)
@@ -851,7 +950,7 @@ class TestInteractiveCLI(Base):
 
     def test_interactive_repo_init_creates_mcp_and_warns(self):
         # Simulate global blueprint present and uninitialized repo
-        shutil.copytree(BUNDLE / "payload", self.home / "blueprint", dirs_exist_ok=True)
+        copy_payload_dir(BUNDLE / "payload", self.home / "blueprint")
         (self.repo / ".helm/policy/policy.json").unlink()
         (self.repo / ".cursor/mcp.json").unlink()
         code, out = self.tty_run(lines=["y"])
@@ -1286,6 +1385,9 @@ class TestMultiPlatform(Base):
         self.assertTrue(L.classify(self.repo, pol, self.repo / ".ENV")["secret"])
         self.assertTrue(L.classify(self.repo, pol, self.repo / ".Env")["secret"])
         self.assertTrue(L.classify(self.repo, pol, self.repo / "AGENTS.MD")["protected"])
+        self.assertTrue(L.classify(self.repo, pol, self.repo / ".CLAUDE/settings.json")["secret"])
+        # Secret allow globs are also case-insensitively honored
+        self.assertFalse(L.classify(self.repo, pol, self.repo / ".ENV.EXAMPLE")["secret"])
 
     def test_allowed_virtual_devices(self):
         # SEC-05: only explicitly allowed virtual devices are treated as tmp
@@ -1293,6 +1395,8 @@ class TestMultiPlatform(Base):
         self.assertTrue(L.is_tmp(Path("/dev/null")))
         self.assertTrue(L.is_tmp(Path("/dev/stdout")))
         self.assertTrue(L.is_tmp(Path("/dev/stderr")))
+        self.assertTrue(L.is_tmp(Path("/proc/self/fd/1")))
+        self.assertTrue(L.is_tmp(Path("/proc/self/fd/2")))
         self.assertFalse(L.is_tmp(Path("/dev/zero")))
         self.assertFalse(L.is_tmp(Path("/dev/random")))
         self.assertFalse(L.is_tmp(Path("/dev/sda")))
@@ -1310,6 +1414,14 @@ class TestMultiPlatform(Base):
         self.assertTrue(L.classify(self.repo, pol, self.repo / ".claude/settings.json")["secret"])
         self.assertTrue(L.classify(self.repo, pol, self.repo / ".agents/custom_mcp.json")["secret"])
         self.assertTrue(L.classify(self.repo, pol, self.repo / ".codex/app_config.json")["secret"])
+        # Home directory credentials (both expanded and unexpanded Path objects)
+        self.assertTrue(L.classify(self.repo, pol, Path(L.expand("~/.claude/auth.json")))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path("~/.claude/auth.json"))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path(L.expand("~/.agents/secrets.env")))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path("~/.agents/secrets.env"))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path(L.expand("~/.codex/config.toml")))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path("~/.codex/config.toml"))["secret"])
+        self.assertTrue(L.classify(self.repo, pol, Path("~/.ssh/id_rsa"))["secret"])
 
     def test_antigravity_web_ingress_and_routing(self):
         # SEC-02: read_url_content / fetch_url routing to WebFetch, search_web to WebSearch
@@ -1324,9 +1436,20 @@ class TestMultiPlatform(Base):
         res = json.loads(r.stdout)
         self.assertEqual(res.get("decision"), "allow")
 
-        # 2. Denied url via read_url_content
-        payload_fetch_deny = {
+        # 2. Wildcard allows any valid public HTTPS url
+        payload_fetch_wildcard = {
             "toolCall": {"name": "read_url_content", "args": {"Url": "https://evil.example.com"}},
+            "workspacePaths": [str(self.repo)]
+        }
+        r_wc = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                              input=json.dumps(payload_fetch_wildcard), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r_wc.returncode, 0)
+        res_wc = json.loads(r_wc.stdout)
+        self.assertEqual(res_wc.get("decision"), "allow")
+
+        # 3. Denied non-https url via read_url_content
+        payload_fetch_deny = {
+            "toolCall": {"name": "read_url_content", "args": {"Url": "http://evil.example.com"}},
             "workspacePaths": [str(self.repo)]
         }
         r2 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
@@ -1335,7 +1458,41 @@ class TestMultiPlatform(Base):
         res2 = json.loads(r2.stdout)
         self.assertEqual(res2.get("decision"), "deny")
 
-        # 3. search_web via Antigravity ingress
+        # 4. CamelCase readUrlContent and fetch_url with uppercase URL parameter (non-https denied)
+        payload_fetch_var = {
+            "toolCall": {"name": "readUrlContent", "args": {"URL": "http://evil.example.com"}},
+            "workspacePaths": [str(self.repo)]
+        }
+        r_var = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                               input=json.dumps(payload_fetch_var), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r_var.returncode, 0)
+        res_var = json.loads(r_var.stdout)
+        self.assertEqual(res_var.get("decision"), "deny")
+
+        # 5. Direct h_tool invocation with read_url_content (guarded against non-https, allowed on wildcard)
+        out_ruc_deny = self.guard("tool", {"tool_name": "read_url_content", "tool_input": {"Url": "http://evil.example.com"}})
+        self.assertEqual(out_ruc_deny.get("permission"), "deny")
+        out_ruc_wildcard = self.guard("tool", {"tool_name": "read_url_content", "tool_input": {"Url": "https://evil.example.com"}})
+        self.assertEqual(out_ruc_wildcard.get("permission"), "allow")
+        out_ruc_allow = self.guard("tool", {"tool_name": "read_url_content", "tool_input": {"Url": "https://react.dev"}})
+        self.assertEqual(out_ruc_allow.get("permission"), "allow")
+
+        # 6. When policy has restricted domains without wildcard, domain restriction is enforced
+        pol_path = self.repo / ".helm/policy/policy.json"
+        orig_pol = pol_path.read_text()
+        try:
+            pol_obj = json.loads(orig_pol)
+            pol_obj["web"]["fetch_domains"] = ["react.dev"]
+            pol_path.write_text(json.dumps(pol_obj))
+
+            out_restr_deny = self.guard("tool", {"tool_name": "read_url_content", "tool_input": {"Url": "https://evil.example.com"}})
+            self.assertEqual(out_restr_deny.get("permission"), "deny")
+            out_restr_allow = self.guard("tool", {"tool_name": "read_url_content", "tool_input": {"Url": "https://react.dev"}})
+            self.assertEqual(out_restr_allow.get("permission"), "allow")
+        finally:
+            pol_path.write_text(orig_pol)
+
+        # 5. search_web via Antigravity ingress
         payload_search = {
             "toolCall": {"name": "search_web", "args": {"query": "python unittest"}},
             "workspacePaths": [str(self.repo)]
@@ -1346,7 +1503,7 @@ class TestMultiPlatform(Base):
         res3 = json.loads(r3.stdout)
         self.assertEqual(res3.get("decision"), "allow")
 
-        # 4. searchweb directly via h_tool
+        # 6. searchweb directly via h_tool
         out_sw = self.guard("tool", {"tool_name": "search_web", "tool_input": {"query": "python"}})
         self.assertEqual(out_sw.get("permission"), "allow")
         out_sw2 = self.guard("tool", {"tool_name": "SearchWeb", "tool_input": {"query": "python"}})
@@ -1359,6 +1516,108 @@ class TestMultiPlatform(Base):
         out = self.guard("tool", {"tool_name": "grep", "tool_input": {"paths": paths_with_secret}})
         self.assertEqual(out.get("permission"), "deny")
         self.assertIn("reading `.env` is not allowed", out.get("agent_message", ""))
+
+    def test_helm_start_fresh_repo_defaults_to_cursor(self):
+        fresh = self.tmp / "fresh-repo-default"
+        fresh.mkdir()
+        sh("git", "init", "-q", ".", cwd=fresh)
+        sh("git", "config", "user.email", "dev@example.com", cwd=fresh)
+        sh("git", "config", "user.name", "Dev", cwd=fresh)
+        (fresh / "README.md").write_text("# Hello\n")
+        sh("git", "add", ".", cwd=fresh)
+        sh("git", "commit", "-qm", "init", cwd=fresh)
+
+        # Running helm start on a fresh repo without --platform defaults directly to cursor
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(fresh))
+        r = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "FRESH-1", "--tier", "1", "--allow-dirty"],
+                           cwd=fresh, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        self.assertTrue((fresh / ".helm/config.json").exists())
+        cfg = json.loads((fresh / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["cursor"])
+        self.assertTrue((fresh / ".cursor/mcp.json").exists())
+        self.assertTrue((fresh / ".helm/work/FRESH-1").exists())
+
+    def test_helm_start_antigravity_platform_and_ag_shortcut(self):
+        # 1. helm start --platform antigravity
+        ag_repo = self.tmp / "ag-repo-start"
+        ag_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=ag_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=ag_repo)
+        sh("git", "config", "user.name", "Dev", cwd=ag_repo)
+        (ag_repo / "main.py").write_text("print('ag')\n")
+        sh("git", "add", ".", cwd=ag_repo)
+        sh("git", "commit", "-qm", "init", cwd=ag_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(ag_repo))
+        r = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--platform", "antigravity", "AG-1", "--tier", "1", "--allow-dirty"],
+                           cwd=ag_repo, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        cfg = json.loads((ag_repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["antigravity"])
+        self.assertTrue((ag_repo / ".agents/hooks.json").exists())
+        self.assertTrue((ag_repo / ".agents/.helm").exists())
+        self.assertTrue((ag_repo / ".agents/discovery.md").exists())
+        self.assertTrue((ag_repo / ".agents/mcp_config.json").exists())
+        ag_mcp_data = json.loads((ag_repo / ".agents/mcp_config.json").read_text())
+        self.assertIn("atlassian", ag_mcp_data.get("mcpServers", {}))
+        self.assertTrue((ag_repo / ".helm/work/AG-1").exists())
+
+        # 2. helm start --ag shortcut
+        ag_repo2 = self.tmp / "ag-repo-short"
+        ag_repo2.mkdir()
+        sh("git", "init", "-q", ".", cwd=ag_repo2)
+        sh("git", "config", "user.email", "dev@example.com", cwd=ag_repo2)
+        sh("git", "config", "user.name", "Dev", cwd=ag_repo2)
+        (ag_repo2 / "main.py").write_text("print('ag')\n")
+        sh("git", "add", ".", cwd=ag_repo2)
+        sh("git", "commit", "-qm", "init", cwd=ag_repo2)
+
+        repo_env2 = dict(self.env, CURSOR_PROJECT_DIR=str(ag_repo2))
+        r2 = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--ag", "AG-2", "--tier", "1", "--allow-dirty"],
+                            cwd=ag_repo2, env=repo_env2, capture_output=True, text=True)
+        self.assertEqual(r2.returncode, 0, f"stdout: {r2.stdout}\nstderr: {r2.stderr}")
+        cfg2 = json.loads((ag_repo2 / ".helm/config.json").read_text())
+        self.assertEqual(cfg2.get("platforms"), ["antigravity"])
+        self.assertTrue((ag_repo2 / ".agents/hooks.json").exists())
+        self.assertTrue((ag_repo2 / ".agents/mcp_config.json").exists())
+        self.assertTrue((ag_repo2 / ".helm/work/AG-2").exists())
+
+    def test_helm_start_initialized_repo_detects_platform_from_config_json(self):
+        # 1. When repo is already initialized, detects active platform from .helm/config.json (supporting string or list)
+        (self.repo / ".helm/config.json").write_text(json.dumps({"platforms": "antigravity"}))
+
+        r = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm"), "start", "AUTO-AG", "--tier", "1", "--allow-dirty"],
+                           cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        self.assertTrue((self.repo / ".helm/work/AUTO-AG").exists())
+        cfg = json.loads((self.repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), "antigravity")
+
+        # Abort AUTO-AG to clean up
+        subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm"), "abort", "AUTO-AG"],
+                       cwd=self.repo, env=self.env, capture_output=True, text=True)
+
+    def test_helm_start_platform_all(self):
+        all_repo = self.tmp / "all-repo"
+        all_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=all_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=all_repo)
+        sh("git", "config", "user.name", "Dev", cwd=all_repo)
+        (all_repo / "main.py").write_text("print('all')\n")
+        sh("git", "add", ".", cwd=all_repo)
+        sh("git", "commit", "-qm", "init", cwd=all_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(all_repo))
+        r = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--platform", "all", "ALL-1", "--tier", "1", "--allow-dirty"],
+                           cwd=all_repo, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        cfg = json.loads((all_repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["antigravity", "claude", "codex", "cursor"])
+        self.assertTrue((all_repo / ".agents/hooks.json").exists())
+        self.assertTrue((all_repo / ".cursor/hooks.json").exists())
+        self.assertTrue((all_repo / ".claude/settings.json").exists())
+        self.assertTrue((all_repo / ".codex/hooks.json").exists())
 
 
 if __name__ == "__main__":

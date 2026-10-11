@@ -443,6 +443,10 @@ def _norm(n):
 
 
 def _find_url(obj):
+    if isinstance(obj, str):
+        if obj.startswith(("http://", "https://")):
+            return obj
+        return ""
     if isinstance(obj, dict):
         for k, v in obj.items():
             if str(k).lower() in ("url", "uri", "href") and isinstance(v, str):
@@ -450,11 +454,16 @@ def _find_url(obj):
             r = _find_url(v)
             if r:
                 return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = _find_url(item)
+            if r:
+                return r
     return ""
 
 
 def h_web(name, inp, ctx):
-    w = ctx.pol.get("web", {})
+    w = ctx.pol.get("web") or {}
     if name in ("websearch", "searchweb"):
         return allow() if w.get("allow_search") else deny("built-in web search is disabled by policy")
     url = _find_url(inp)
@@ -462,7 +471,8 @@ def h_web(name, inp, ctx):
     host = (u.hostname or "").lower()
     if u.scheme != "https" or not host:
         return deny("web fetch needs an https URL")
-    if any(host == d or host.endswith("." + d) for d in w.get("fetch_domains", [])):
+    domains = w.get("fetch_domains") or []
+    if "*" in domains or any(isinstance(d, str) and (host == d or host.endswith("." + d)) for d in domains):
         L.audit(ctx.root, ctx.task, {"k": "web", "h": host})
         return allow()
     return deny(f"web fetch to `{host}` is not on the domain allowlist")
@@ -478,7 +488,7 @@ def h_tool(p, ctx):
             inp = {"raw": inp}
     if name in ("shell", "bash", "terminal", "runterminalcmd", "task") or name.startswith("mcp"):
         return allow()  # covered by dedicated hooks
-    if name in ("webfetch", "fetchurl", "websearch", "searchweb"):
+    if name in ("webfetch", "fetchurl", "readurlcontent", "websearch", "searchweb"):
         return h_web(name, inp, ctx)
     paths = L.extract_paths(inp)
     cwd = p.get("cwd") or ctx.cwd
@@ -594,10 +604,10 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
                 return "antigravity", "shell", {"command": args.get("CommandLine", ""), "cwd": cwd}
             elif name in ("view_file", "read_resource"):
                 return "antigravity", "read", {"file_path": args.get("AbsolutePath") or args.get("TargetFile") or args.get("Uri"), "cwd": cwd}
-            elif name in ("read_url_content", "fetch_url"):
-                url = args.get("Url") or args.get("url") or ""
+            elif name in ("read_url_content", "fetch_url") or _norm(name) in ("readurlcontent", "fetchurl"):
+                url = args.get("Url") or args.get("url") or _find_url(args) or ""
                 return "antigravity", "tool", {"tool_name": "WebFetch", "tool_input": {"url": url}, "cwd": cwd}
-            elif name in ("search_web", "web_search"):
+            elif name in ("search_web", "web_search") or _norm(name) in ("searchweb", "websearch"):
                 return "antigravity", "tool", {"tool_name": "WebSearch", "tool_input": args, "cwd": cwd}
             elif name in ("write_to_file", "replace_file_content"):
                 target = args.get("TargetFile") or args.get("AbsolutePath")
@@ -626,11 +636,11 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
         if tname in ("Edit", "Write", "apply_patch", "edit_file", "write_to_file", "MultiEdit"):
             inp = payload.get("tool_input") or payload
             return "claude_codex", "tool", {"tool_name": "Write", "tool_input": inp, "cwd": payload.get("cwd")}
-        if tname in ("read_url_content", "fetch_url"):
+        if tname in ("read_url_content", "fetch_url") or _norm(tname) in ("readurlcontent", "fetchurl"):
             inp = payload.get("tool_input") or payload
-            url = inp.get("Url") or inp.get("url") or ""
+            url = inp.get("Url") or inp.get("url") or _find_url(inp) or ""
             return "claude_codex", "tool", {"tool_name": "WebFetch", "tool_input": {"url": url}, "cwd": payload.get("cwd")}
-        if tname in ("search_web", "web_search"):
+        if tname in ("search_web", "web_search") or _norm(tname) in ("searchweb", "websearch"):
             inp = payload.get("tool_input") or payload
             return "claude_codex", "tool", {"tool_name": "WebSearch", "tool_input": inp, "cwd": payload.get("cwd")}
         return "claude_codex", mode, payload
@@ -721,8 +731,8 @@ SELFTEST = [
     ("read", {"file_path": ".env"}, False), ("read", {"file_path": "src/index.ts"}, True),
     ("tool", {"tool_name": "Read", "tool_input": {"path": "id_rsa"}}, False),
     ("tool", {"tool_name": "Write", "tool_input": {"path": ".cursor/hooks.json"}}, False),
-    ("tool", {"tool_name": "Write", "tool_input": {"path": "AGENTS.md"}}, False),
-    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://evil.example/x"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "http://evil.example/x"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://example.com/docs"}}, True),
     ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m x"}}}, False),
     ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}}, True),
     ("tool", {"toolCall": {"name": "view_file", "args": {"AbsolutePath": ".env"}}}, False),

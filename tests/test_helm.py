@@ -1040,6 +1040,10 @@ class TestMultiPlatform(Base):
         self.assertFalse((new_repo / ".cursor/hooks.json").exists())
         cfg = json.loads((new_repo / ".helm/config.json").read_text())
         self.assertEqual(cfg.get("platforms"), ["antigravity"])
+        gi_content = (new_repo / ".gitignore").read_text()
+        self.assertIn(".agents/", gi_content)
+        self.assertIn(".helm/", gi_content)
+        self.assertIn("AGENTS.md", gi_content)
 
     def test_antigravity_guard_pretooluse(self):
         # 1. Deny git commit

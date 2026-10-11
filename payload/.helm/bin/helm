@@ -2260,15 +2260,6 @@ def folder_hash(d: Path):
 
 def discovered_skills(root):
     found = {}
-    homes = [Path.home() / ".cursor/skills", Path.home() / ".claude/skills", Path.home() / ".agents/skills", Path.home() / ".codex/skills"]
-    for base in homes:
-        try:
-            if base.is_dir():
-                for s in base.iterdir():
-                    if (s / "SKILL.md").exists():
-                        found[str(s)] = ("user", s)
-        except OSError:
-            pass
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if d not in (".git", "node_modules", ".helm")]
         if "SKILL.md" in fn:
@@ -2439,10 +2430,14 @@ def doctor_checks(root, pol):
     add("PASS" if has_mcp else "WARN", f"{mcp_cfg_path}: Atlassian MCP credentials configured" if has_mcp else f"{mcp_cfg_path}: Atlassian MCP has placeholder/missing credentials ({', '.join(mcp_missing)}) — Local Story Mode active until configured")
     ov = overlay_info(root, pol)
     add("PASS" if ov["present"] else "WARN", "repo overlay present" + (f" (STALE: {len(ov['stale_files'])} watched files changed)" if ov.get("stale_files") else "") if ov["present"] else "no repo overlay yet: `helm bootstrap start`")
-    co = [root / "CODEOWNERS", root / ".github/CODEOWNERS", root / "docs/CODEOWNERS"]
-    cot = "".join(p.read_text(errors="replace") for p in co if p.exists())
-    covers_framework = any(p in cot for p in (".cursor", ".agents", ".claude", ".codex")) and ".helm" in cot
-    add("PASS" if covers_framework else "WARN", "CODEOWNERS covers framework directories and .helm/" if covers_framework else "CODEOWNERS does not cover framework directories (framework changes unreviewed)")
+    gi_helm = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".helm"]).returncode == 0
+    if gi_helm:
+        add("PASS", "framework files are gitignored (clean local developer workflow)")
+    else:
+        co = [root / "CODEOWNERS", root / ".github/CODEOWNERS", root / "docs/CODEOWNERS"]
+        cot = "".join(p.read_text(errors="replace") for p in co if p.exists())
+        covers_framework = any(p in cot for p in (".cursor", ".agents", ".claude", ".codex")) and ".helm" in cot
+        add("PASS" if covers_framework else "WARN", "CODEOWNERS covers framework directories and .helm/" if covers_framework else "CODEOWNERS does not cover framework directories (framework changes unreviewed)")
     add("INFO", "managed hooks at /etc/cursor/hooks.json: " + ("present" if Path("/etc/cursor/hooks.json").exists() else "absent (project hooks are agent-reachable only via protected-path rules; ask IT for managed hooks)"))
     fails = G.selftest(root)
     add("PASS" if not fails else "FAIL", f"guard policy self-test: {len(G.SELFTEST)} cases" if not fails else "guard self-test failures: " + " | ".join(fails[:3]))
@@ -2485,7 +2480,7 @@ def cmd_doctor(a):
         tag = ctext(f"[{lvl:<4}]", lvl_color.get(lvl, "dim"))
         print(f"{tag} {msg}")
     fails = sum(1 for l, _ in res if l == "FAIL")
-    print(f"\n{fails} failure(s). " + ("Do NOT start tasks until these are fixed." if fails else "Static checks pass. Run `helm doctor --live` to prove hooks fire through the real Cursor CLI."))
+    print(f"\n{fails} failure(s). " + ("Do NOT start tasks until these are fixed." if fails else "Static checks pass. Run `helm doctor --live` to prove hooks fire through your active AI runner."))
     sys.exit(1 if fails else 0)
 
 

@@ -21,19 +21,32 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / "payload"
 BEGIN, END = "<!-- HELM:BEGIN", "<!-- HELM:END -->"
-GITIGNORE = [
-    ".helm/",
-    ".cursor/agents/",
-    ".cursor/commands/",
-    ".cursor/skills/",
-    ".cursor/cli.json",
-    ".cursor/hooks.json",
-    ".cursor/mcp.json",
-    "AGENTS.md",
-    "mcp_jira_config.json",
-    "__pycache__/",
-    "*.py[cod]",
-]
+def get_platform_gitignores(platforms: list[str]) -> list[str]:
+    ignores = [
+        ".helm/",
+        "AGENTS.md",
+        "mcp_jira_config.json",
+        "__pycache__/",
+        "*.py[cod]",
+    ]
+    if "antigravity" in platforms:
+        ignores.append(".agents/")
+    if "claude" in platforms:
+        ignores.append(".claude/")
+    if "codex" in platforms:
+        ignores.append(".codex/")
+    if "cursor" in platforms:
+        ignores.extend([
+            ".cursor/agents/",
+            ".cursor/commands/",
+            ".cursor/skills/",
+            ".cursor/cli.json",
+            ".cursor/hooks.json",
+            ".cursor/mcp.json",
+        ])
+    return ignores
+
+
 MERGED = {".cursor/hooks.json", ".cursor/cli.json", ".cursor/mcp.json"}
 KEEP_IF_EXISTS = {".helm/skills.lock.json"}
 
@@ -324,9 +337,10 @@ def main():
 
     gi = repo / ".gitignore"
     cur = gi.read_text() if gi.exists() else ""
-    add = [l for l in GITIGNORE if l not in cur.splitlines()]
+    platform_ignores = get_platform_gitignores(platforms)
+    add = [l for l in platform_ignores if l not in cur.splitlines()]
     if add:
-        gi.write_text(cur.rstrip("\n") + ("\n" if cur else "") + "# HELM task artifacts (may contain Jira content)\n" + "\n".join(add) + "\n")
+        gi.write_text(cur.rstrip("\n") + ("\n" if cur else "") + "# HELM local developer governance files\n" + "\n".join(add) + "\n")
         say(f".gitignore += {', '.join(add)}")
 
     env = dict(os.environ)
@@ -335,24 +349,14 @@ def main():
     r = subprocess.run([sys.executable, str(repo / ".helm/bin/helm"), "doctor"], cwd=repo, env=env, capture_output=True, text=True)
     print("\n--- helm doctor ---\n" + r.stdout)
 
-    pdirs = []
-    if "antigravity" in platforms: pdirs.append(".agents")
-    if "claude" in platforms: pdirs.append(".claude")
-    if "codex" in platforms: pdirs.append(".codex")
-    if "cursor" in platforms: pdirs.append(".cursor")
-    p_add = " ".join(pdirs) if pdirs else ".cursor"
-    co_lines = "\n".join(f"       /{d}/   @your-platform-team" for d in pdirs) if pdirs else "       /.cursor/   @your-platform-team"
-
     print("NEXT STEPS\n"
-          "  1. Review and COMMIT the framework files (a clean tree is required to start tasks):\n"
-          f"       git add {p_add} .helm AGENTS.md .gitignore && git commit -m 'chore: add HELM framework'\n"
-          "  2. Add to CODEOWNERS (so framework changes need review):\n"
-          f"{co_lines}\n       /.helm/     @your-platform-team\n       /AGENTS.md  @your-platform-team\n"
-          "  3. Configure the Atlassian MCP server (set JIRA_URL, JIRA_USERNAME, JIRA_API_TOKEN)\n"
-          "     or leave as placeholders to use Local Story Mode (STORY.md).\n"
-          "  4. Put helm on your PATH:  ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm\n"
-          "  5. helm doctor --live        # proves hooks really fire through your AI runner (do not skip)\n"
-          "  6. helm bootstrap start      # then /bootstrap with your agent: builds the repo-specific layer")
+          "  1. Framework files are gitignored for clean local workflows (zero codebase pollution).\n"
+          "     Only your actual source code changes will be committed to the repository.\n"
+          "  2. Configure Atlassian MCP credentials in .cursor/mcp.json if using Jira/Confluence\n"
+          "     or leave empty to use Local Story Mode (STORY.md).\n"
+          "  3. Put helm on your PATH:  ln -s \"$PWD/.helm/bin/helm\" ~/.local/bin/helm\n"
+          "  4. helm doctor --live        # proves hooks really fire through your AI runner (do not skip)\n"
+          "  5. helm start <TASK_ID>      # begin your governed engineering workflow")
 
     if sys.stdin.isatty() and sys.stdout.isatty():
         try:

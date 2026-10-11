@@ -1698,6 +1698,11 @@ def get_cli_runner(root: Path | None = None) -> list[str] | None:
 def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int, list[str]]:
     """Execute CLI runner, streaming stdout/stderr live while buffering lines for error analysis."""
     captured: list[str] = []
+    border = "─" * 70
+    runner_cmd = " ".join(runner)
+    print(ctext(f"┌{border}┐", "bold_blue"))
+    print(ctext(f"│  🤖 Live Agent Stream: {runner_cmd:<46}│", "bold_blue"))
+    print(ctext(f"├{border}┤\n", "bold_blue"))
     try:
         proc = subprocess.Popen(
             runner + [prompt],
@@ -1714,8 +1719,10 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
                 captured.append(line)
             proc.stdout.close()
         rc = proc.wait()
+        print(ctext(f"\n└{border}┘", "bold_blue"))
         return rc, captured
     except Exception as e:
+        print(ctext(f"\n└{border}┘", "bold_blue"))
         return 1, [f"Failed to execute process: {e}"]
 
 
@@ -1874,10 +1881,30 @@ def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: st
 
     runner = get_cli_runner(root) if not manual else None
     if runner:
-        print(ctext(f"🚀 Executing via CLI runner: {' '.join(runner)} ...\n", "green"))
+        print(ctext(f"🚀 Launching CLI runner: {' '.join(runner)} ...\n", "green"))
         rc, output_lines = execute_cli_runner(runner, full_prompt, root)
-        if rc == 0:
-            print(ctext("\n✔ CLI runner execution completed successfully.", "green"))
+
+        expected_artifact = None
+        if role_name == "discovery":
+            expected_artifact = root / wd_rel / "WORK.md"
+        elif role_name == "planner":
+            expected_artifact = root / wd_rel / "PLAN.md"
+        elif role_name == "test-analyst":
+            expected_artifact = root / wd_rel / "TEST-PLAN.md"
+        elif role_name == "reviewer":
+            expected_artifact = root / wd_rel / "REVIEW.md"
+
+        has_artifact = bool(expected_artifact and expected_artifact.exists() and expected_artifact.stat().st_size > 0)
+
+        if rc == 0 and has_artifact:
+            print(ctext(f"\n✔ {role_name.capitalize()} completed: {expected_artifact.relative_to(root)} produced.", "bold_green"))
+            _show_status()
+            sys.exit(0)
+        elif rc == 0:
+            art_name = str(expected_artifact.relative_to(root)) if expected_artifact else "expected artifact"
+            print(ctext(f"\n⚠️  Agent session concluded, but {art_name} was not created.", "bold_orange"))
+            print(ctext("   Review agent output above. If the agent requested human clarification or encountered a block,", "dim"))
+            print(ctext("   address it, then re-run to continue.\n", "dim"))
             _show_status()
             sys.exit(0)
         else:

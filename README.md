@@ -1,10 +1,13 @@
 <div align="center">
   <img src="docs/assets/logo.png" width="160" alt="HELM Logo" />
   <h1>HELM</h1>
-  <p><b>Human-Controlled AI Engineering Framework for Cursor & CLI</b></p>
+  <p><b>Human-Controlled AI Engineering Framework for Antigravity, Claude Code, Codex & Cursor</b></p>
 
   <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.9+"></a>
-  <a href="https://cursor.com"><img src="https://img.shields.io/badge/Cursor-CLI%20%26%20IDE-000000?style=flat-square" alt="Cursor Compatible"></a>
+  <a href="https://cursor.com"><img src="https://img.shields.io/badge/Cursor-Supported-000000?style=flat-square" alt="Cursor Compatible"></a>
+  <a href="https://antigravity.google"><img src="https://img.shields.io/badge/Antigravity-Supported-4285F4?style=flat-square" alt="Antigravity Compatible"></a>
+  <a href="https://anthropic.com"><img src="https://img.shields.io/badge/Claude%20Code-Supported-D97706?style=flat-square" alt="Claude Code Compatible"></a>
+  <a href="https://openai.com"><img src="https://img.shields.io/badge/Codex%20CLI-Supported-10A37F?style=flat-square" alt="Codex CLI Compatible"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="License MIT"></a>
 </div>
 
@@ -12,7 +15,7 @@
 
 > **Agents investigate, propose, implement, and verify — humans decide, approve, and own the resulting Git history.**
 
-HELM is an installable, repo-agnostic governance layer for **Cursor** (CLI and IDE). It equips AI agents to perform deep investigation, code edits, and verification checks while maintaining strict human-in-the-loop gates over architecture, business decisions, and Git releases.
+HELM is an installable, repo-agnostic governance layer for modern AI coding agents (**Google Antigravity**, **Anthropic Claude Code**, **OpenAI Codex**, and **Cursor**). It equips AI agents to perform deep investigation, code edits, and verification checks while maintaining strict human-in-the-loop gates over architecture, business decisions, and Git releases.
 
 ---
 
@@ -66,19 +69,20 @@ Simply navigate to any project repository and run:
 
 ```bash
 helm start
+# or explicitly: python3 install.py . --platform [antigravity|claude|codex|cursor|all]
 ```
 
-> **Automatic Repository Initialization**: If HELM is not yet initialized in the target repository, `helm start` will automatically prompt to set up `.cursor/`, `.helm/`, and governance rules for that project on the fly.
+> **Automatic Repository Initialization**: If HELM is not yet initialized in the target repository, `helm start` will automatically prompt you to select your AI coding platform (**Google Antigravity**, **Claude Code**, **Codex**, or **Cursor**) and configure the corresponding hooks and governance layer on the fly.
 
 ### 3. First-Time Verification Checklist
 
-1. **Protect Framework Configuration**: Add `/.cursor/ /.helm/ /AGENTS.md` to `CODEOWNERS`.
-2. **Configure Jira / Atlassian MCP** (Optional): Set credentials in `.cursor/mcp.json` or leave as placeholders for Local Story Mode (`STORY.md`).
+1. **Protect Framework Configuration**: Add framework directories (`/.agents/`, `/.cursor/`, `/.claude/`, `/.helm/`, `/AGENTS.md`) to `CODEOWNERS`.
+2. **Configure Jira / Atlassian MCP** (Optional): Set credentials in `.cursor/mcp.json` / `.agents/mcp_config.json` or leave as placeholders for Local Story Mode (`STORY.md`).
 3. **Verify Security Hooks**:
    ```bash
    helm doctor --live
    ```
-   *Proves that fail-closed guard hooks actively fire in your local Cursor CLI environment.*
+   *Proves that fail-closed guard hooks actively fire in your local AI agent CLI environment.*
 
 ---
 

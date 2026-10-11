@@ -578,20 +578,98 @@ HANDLERS = {"shell": h_shell, "mcp": h_mcp, "tool": h_tool, "read": h_read, "sub
             "session": h_session, "postedit": h_postedit}
 
 
-def run(mode, payload):
+def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tuple[str, str, dict]:
+    """Detects platform schema and normalizes into canonical HELM internal event."""
+    plat = platform_hint.lower() if platform_hint else ""
+
+    # 1. Antigravity format (camelCase protojson or explicit hint)
+    if plat in ("antigravity", "gemini") or "toolCall" in payload or "workspacePaths" in payload:
+        if "toolCall" in payload:
+            tc = payload["toolCall"]
+            name = tc.get("name", "")
+            args = tc.get("args") or {}
+            ws = (payload.get("workspacePaths") or [None])[0]
+            cwd = args.get("Cwd") or ws
+            if name == "run_command":
+                return "antigravity", "shell", {"command": args.get("CommandLine", ""), "cwd": cwd}
+            elif name in ("view_file", "read_resource", "read_url_content"):
+                return "antigravity", "read", {"file_path": args.get("AbsolutePath") or args.get("TargetFile") or args.get("Uri"), "cwd": cwd}
+            elif name in ("write_to_file", "replace_file_content"):
+                target = args.get("TargetFile") or args.get("AbsolutePath")
+                return "antigravity", "tool", {"tool_name": "Write", "tool_input": {"path": target}, "cwd": cwd}
+            elif name in ("invoke_subagent", "define_subagent", "manage_subagents"):
+                return "antigravity", "subagent", {"subagent_type": args.get("name") or "subagent"}
+            elif name.startswith("mcp_") or name == "call_mcp_tool":
+                server = args.get("ServerName") or (name.split("_", 1)[1] if "_" in name else "unknown")
+                return "antigravity", "mcp", {"mcp_server_name": server, "tool_name": args.get("ToolName") or name}
+            else:
+                return "antigravity", "tool", {"tool_name": name, "tool_input": args, "cwd": cwd}
+        return "antigravity", mode, payload
+
+    # 2. Claude Code & Codex format (explicit hint, matcher/turn_id, or Bash tool)
+    is_claude_codex = (
+        plat in ("claude", "codex", "claude_codex")
+        or "matcher" in payload
+        or "hook_event_name" in payload
+        or payload.get("tool_name") == "Bash"
+    )
+    if is_claude_codex:
+        tname = payload.get("tool_name") or payload.get("tool") or payload.get("matcher") or ""
+        if tname in ("Bash", "bash", "exec_command"):
+            cmd = payload.get("command") or payload.get("tool_input", {}).get("command", "") or payload.get("tool_input", {}).get("CommandLine", "")
+            return "claude_codex", "shell", {"command": cmd, "cwd": payload.get("cwd")}
+        if tname in ("Edit", "Write", "apply_patch", "edit_file", "write_to_file", "MultiEdit"):
+            inp = payload.get("tool_input") or payload
+            return "claude_codex", "tool", {"tool_name": "Write", "tool_input": inp, "cwd": payload.get("cwd")}
+        return "claude_codex", mode, payload
+
+    # 3. Native Cursor format (default)
+    return "cursor", mode, payload
+
+
+def format_egress(platform: str, out: dict) -> tuple[dict, int]:
+    is_deny = out.get("permission") == "deny"
+    reason = out.get("user_message") or out.get("agent_message") or "Denied by HELM"
+
+    if platform == "antigravity":
+        if is_deny:
+            return {"decision": "deny", "reason": reason}, 0
+        return {"decision": "allow"}, 0
+
+    if platform == "claude_codex":
+        if is_deny:
+            sys.stderr.write(f"HELM POLICY_BLOCK: {reason}\n")
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}, 2
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}, 0
+
+    return out, 0
+
+
+def run(mode, payload, root=None, platform_hint=""):
+    platform, eff_mode, eff_payload = normalize_ingress(mode, payload, platform_hint)
     try:
-        start = os.environ.get("CURSOR_PROJECT_DIR") or (payload.get("workspace_roots") or [None])[0] or payload.get("cwd")
-        root = L.find_root(start)
+        if root is None:
+            start = (
+                os.environ.get("CURSOR_PROJECT_DIR")
+                or (payload.get("workspacePaths") or [None])[0]
+                or (payload.get("workspace_roots") or [None])[0]
+                or eff_payload.get("cwd")
+                or payload.get("cwd")
+            )
+            root = L.find_root(start)
         pol = L.load_policy(root)
-        ctx = Ctx(root, pol, payload.get("cwd"))
-        h = HANDLERS.get(mode)
+        ctx = Ctx(root, pol, eff_payload.get("cwd") or payload.get("cwd") or str(root))
+        h = HANDLERS.get(eff_mode)
         if h is None:
-            return deny(f"unknown guard mode `{mode}`") if mode in PERMISSION_MODES else {}
-        return h(payload, ctx)
+            raw_out = deny(f"unknown guard mode `{eff_mode}`") if eff_mode in PERMISSION_MODES else {}
+        else:
+            raw_out = h(eff_payload, ctx)
     except Exception as e:  # fail closed for permission hooks
-        if mode in PERMISSION_MODES:
-            return deny(f"guard internal error ({type(e).__name__}: {str(e)[:120]}) — failing closed")
-        return {}
+        if eff_mode in PERMISSION_MODES:
+            raw_out = deny(f"guard internal error ({type(e).__name__}: {str(e)[:120]}) — failing closed")
+        else:
+            raw_out = {}
+    return format_egress(platform, raw_out)
 
 
 # --------------------------------------------------------------------------- self-test (used by `helm doctor`)
@@ -633,6 +711,12 @@ SELFTEST = [
     ("tool", {"tool_name": "Write", "tool_input": {"path": ".cursor/hooks.json"}}, False),
     ("tool", {"tool_name": "Write", "tool_input": {"path": "AGENTS.md"}}, False),
     ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://evil.example/x"}}, False),
+    ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m x"}}}, False),
+    ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}}, True),
+    ("tool", {"toolCall": {"name": "view_file", "args": {"AbsolutePath": ".env"}}}, False),
+    ("tool", {"toolCall": {"name": "view_file", "args": {"AbsolutePath": "src/index.ts"}}}, True),
+    ("tool", {"tool_name": "Bash", "command": "git push"}, False),
+    ("tool", {"tool_name": "Bash", "command": "git status"}, True),
 ]
 
 
@@ -642,38 +726,57 @@ def selftest(root):
     pol = L.load_policy(root)
     fails = []
     for mode, payload, want in SELFTEST:
-        ctx = Ctx(root, pol, str(root))
-        ctx.active, ctx.tampered = None, False
-        if mode == "mcp":  # do not pollute counters
-            orig = L.bump_counter
+        orig = L.bump_counter
+        if mode == "mcp":
             L.bump_counter = lambda *a, **k: 0
         try:
-            out = HANDLERS[mode](payload, ctx)
+            out, _ = run(mode, payload, root=root)
         finally:
             if mode == "mcp":
                 L.bump_counter = orig
-        got = out.get("permission") == "allow"
+        got = (
+            (out.get("permission") == "allow")
+            or (out.get("decision") == "allow")
+            or (out.get("hookSpecificOutput", {}).get("permissionDecision") == "allow")
+        )
         if got != want:
             fails.append(f"{mode} {json.dumps(payload)[:90]} → expected {'allow' if want else 'deny'}, got {'allow' if got else 'deny'}")
     return fails
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    mode = ""
+    platform_hint = ""
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == "--platform" and i + 1 < len(sys.argv):
+            platform_hint = sys.argv[i + 1]
+            i += 2
+            continue
+        elif not mode and not arg.startswith("-"):
+            mode = arg
+        i += 1
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         payload = {}
     if os.environ.get("HELM_PROBE"):  # record payload SHAPE (keys only) to learn the real schema
         try:
-            root = L.find_root(os.environ.get("CURSOR_PROJECT_DIR"))
+            start = (
+                os.environ.get("CURSOR_PROJECT_DIR")
+                or (payload.get("workspacePaths") or [None])[0]
+                or payload.get("cwd")
+            )
+            root = L.find_root(start)
             def shape(o):
                 return {k: shape(v) for k, v in o.items()} if isinstance(o, dict) else type(o).__name__
             L.audit(root, "_probe", {"k": "probe", "mode": mode, "shape": shape(payload)})
         except Exception:
             pass
-    sys.stdout.write(json.dumps(run(mode, payload)))
-    return 0
+    res, rc = run(mode, payload, platform_hint=platform_hint)
+    sys.stdout.write(json.dumps(res))
+    return rc
 
 
 if __name__ == "__main__":

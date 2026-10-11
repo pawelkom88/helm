@@ -1023,6 +1023,87 @@ class TestPromptInjectionDefenses(Base):
             self.assertEqual(details, '"Fix authentication refresh token bug"')
 
 
+class TestMultiPlatform(Base):
+    def test_install_antigravity(self):
+        new_repo = self.tmp / "ag-repo"
+        new_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=new_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=new_repo)
+        sh("git", "config", "user.name", "Dev", cwd=new_repo)
+        (new_repo / "main.py").write_text("print('hello')\n")
+        sh("git", "add", ".", cwd=new_repo)
+        sh("git", "commit", "-qm", "init", cwd=new_repo)
+
+        sh(sys.executable, str(BUNDLE / "install.py"), str(new_repo), "--platform", "antigravity", cwd=new_repo, env=self.env)
+        self.assertTrue((new_repo / ".agents/hooks.json").exists())
+        self.assertTrue((new_repo / ".agents/skills").exists())
+        self.assertFalse((new_repo / ".cursor/hooks.json").exists())
+        cfg = json.loads((new_repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["antigravity"])
+
+    def test_antigravity_guard_pretooluse(self):
+        # 1. Deny git commit
+        payload_git = {"toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m evil"}}, "workspacePaths": [str(self.repo)]}
+        r = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                           input=json.dumps(payload_git), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r.returncode, 0)
+        res = json.loads(r.stdout)
+        self.assertEqual(res.get("decision"), "deny")
+        self.assertIn("git commit", res.get("reason", "").lower())
+
+        # 2. Allow git status
+        payload_status = {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}, "workspacePaths": [str(self.repo)]}
+        r2 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                            input=json.dumps(payload_status), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r2.returncode, 0)
+        res2 = json.loads(r2.stdout)
+        self.assertEqual(res2.get("decision"), "allow")
+
+        # 3. Deny secret read
+        payload_sec = {"toolCall": {"name": "view_file", "args": {"AbsolutePath": str(self.repo / ".env")}}, "workspacePaths": [str(self.repo)]}
+        r3 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "tool"],
+                            input=json.dumps(payload_sec), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r3.returncode, 0)
+        res3 = json.loads(r3.stdout)
+        self.assertEqual(res3.get("decision"), "deny")
+
+    def test_claude_codex_guard_bash(self):
+        # 1. Deny git push
+        payload_push = {"tool_name": "Bash", "command": "git push origin main", "cwd": str(self.repo)}
+        r = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "shell", "--platform", "claude"],
+                           input=json.dumps(payload_push), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("git push", r.stderr.lower())
+
+        # 2. Allow git status
+        payload_status = {"tool_name": "Bash", "command": "git status", "cwd": str(self.repo)}
+        r2 = subprocess.run([sys.executable, str(self.repo / ".helm/bin/helm_guard.py"), "shell", "--platform", "claude"],
+                            input=json.dumps(payload_status), text=True, capture_output=True, cwd=self.repo, env=self.env)
+        self.assertEqual(r2.returncode, 0)
+        res2 = json.loads(r2.stdout)
+        self.assertEqual(res2.get("hookSpecificOutput", {}).get("permissionDecision"), "allow")
+
+    def test_multi_platform_runner_selection(self):
+        import importlib.machinery
+        import importlib.util
+        helm_path = self.repo / ".helm/bin/helm"
+        loader = importlib.machinery.SourceFileLoader("helm_cli", str(helm_path))
+        spec = importlib.util.spec_from_loader("helm_cli", loader)
+        helm_cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(helm_cli)
+
+        with unittest.mock.patch("shutil.which") as mock_which:
+            mock_which.side_effect = lambda b: f"/usr/local/bin/{b}" if b == "agy" else None
+            # With antigravity config
+            (self.repo / ".helm/config.json").write_text(json.dumps({"platforms": ["antigravity"]}))
+            runner = helm_cli.get_cli_runner(self.repo)
+            self.assertEqual(runner, ["agy", "-p"])
+
+            # Diagnostic format
+            diag = helm_cli.format_runner_diagnostics(["agy", "-p"], 1, ["unauthorized: authentication required"], "discovery", "PROJ-1")
+            self.assertIn("agy auth login", diag)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

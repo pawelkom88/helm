@@ -1445,8 +1445,8 @@ def cmd_verify(a):
         sys.exit(1)
 
 
-def get_cli_runner() -> list[str] | None:
-    """Check for configured HELM_CLI_CMD or common CLI agents."""
+def get_cli_runner(root: Path | None = None) -> list[str] | None:
+    """Check for configured HELM_CLI_CMD, platform config, or common CLI agents."""
     custom = os.environ.get("HELM_CLI_CMD")
     if custom is not None:
         val = custom.strip().lower()
@@ -1458,9 +1458,43 @@ def get_cli_runner() -> list[str] | None:
         else:
             print(cwarn(f"HELM_CLI_CMD binary '{parts[0]}' not found on PATH. Falling back to manual mode.\n"))
             return None
-    for cand in ["cursor-agent"]:
-        if shutil.which(cand):
-            return [cand, "-p", "--force", "--trust"]
+
+    # Determine platform(s)
+    platforms = []
+    if root is not None and (root / ".helm/config.json").exists():
+        cfg = L.load_json(root / ".helm/config.json", {})
+        platforms = cfg.get("platforms", [])
+    env_plat = os.environ.get("HELM_PLATFORM")
+    if env_plat:
+        platforms = [env_plat.strip().lower()]
+
+    if not platforms and root is not None:
+        if (root / ".agents").exists():
+            platforms.append("antigravity")
+        if (root / ".claude").exists():
+            platforms.append("claude")
+        if (root / ".codex").exists():
+            platforms.append("codex")
+        if (root / ".cursor").exists():
+            platforms.append("cursor")
+
+    if not platforms:
+        platforms = ["antigravity", "claude", "codex", "cursor"]
+
+    for plat in platforms:
+        if plat in ("antigravity", "gemini"):
+            for cand in ["agy", "antigravity", "gemini"]:
+                if shutil.which(cand):
+                    return [cand, "-p"]
+        elif plat == "claude":
+            if shutil.which("claude"):
+                return ["claude", "-p", "--dangerously-skip-permissions"]
+        elif plat == "codex":
+            if shutil.which("codex"):
+                return ["codex", "exec"]
+        elif plat == "cursor":
+            if shutil.which("cursor-agent"):
+                return ["cursor-agent", "-p", "--force", "--trust"]
     return None
 
 
@@ -1491,25 +1525,27 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
 def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: list[str], role_name: str, task_id: str) -> str:
     combined = "\n".join(output_lines).lower()
     slash_cmd = f"/work {task_id}" if role_name == "discovery" else ("/review" if role_name == "reviewer" else "/continue")
+    bin_name = os.path.basename(runner[0])
 
     if any(k in combined for k in ("usage limit", "get cursor pro", "actionrequirederror", "quota exceeded", "insufficient credits", "429")):
-        reason = "Cursor Agent Usage Limit Reached (Cursor Pro subscription or quota required)"
+        reason = f"AI Agent Usage Limit Reached ({bin_name} quota exceeded or subscription required)"
         tips = [
-            "• Option 1: Check your usage or upgrade at https://cursor.com/settings",
-            f"• Option 2: Run directly in Cursor IDE: use the prompt above or type {ctext(slash_cmd, 'cyan')} in Composer / Chat",
+            f"• Option 1: Check your account usage or subscription settings for {bin_name}",
+            f"• Option 2: Run directly in your AI agent interface using the prompt above",
             "• Option 3: Disable CLI auto-runner: export HELM_CLI_CMD=off (or manual)",
         ]
     elif any(k in combined for k in ("not logged in", "unauthorized", "authentication required", "please log in", "session expired", "401")):
-        reason = "Cursor Agent Authentication Required"
+        reason = f"AI Agent Authentication Required ({bin_name})"
+        login_cmd = f"{bin_name} auth login" if bin_name in ("agy", "antigravity") else (f"{bin_name} login" if bin_name in ("claude", "cursor-agent") else f"configure credentials for {bin_name}")
         tips = [
-            "• Option 1: Authenticate Cursor CLI by running `cursor-agent login`",
-            f"• Option 2: Proceed manually in Cursor IDE using {ctext(slash_cmd, 'cyan')}",
+            f"• Option 1: Authenticate CLI by running `{login_cmd}`",
+            f"• Option 2: Proceed manually in your agent interface with the prompt above",
         ]
     elif any(k in combined for k in ("econnrefused", "timeout", "network error", "connection failed", "could not resolve")):
         reason = "Network or API Connectivity Failure"
         tips = [
             "• Option 1: Check your internet connection or proxy/VPN configuration",
-            f"• Option 2: Proceed manually in Cursor IDE using {ctext(slash_cmd, 'cyan')}",
+            f"• Option 2: Proceed manually using the exact prompt above",
         ]
     else:
         reason = f"CLI runner process exited with error code {returncode}"
@@ -1517,7 +1553,7 @@ def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: 
         error_preview = " | ".join(last_errors) if last_errors else "No diagnostic error output captured."
         tips = [
             f"• Details: {error_preview}",
-            f"• Proceed manually using the exact prompt above or run {ctext(slash_cmd, 'cyan')} in Cursor IDE",
+            f"• Proceed manually using the exact prompt above",
         ]
 
     border = "─" * 70
@@ -1539,7 +1575,7 @@ def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: 
 def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: str, context_notes: str = "", story_file: Path | None = None, pol: dict | None = None, manual: bool = False):
     """Dispatch an AI agent role, running HELM_CLI_CMD if configured, or formatting the exact prompt."""
     wd_rel = f"{L.WORK_REL}/{task_id}"
-    spec_rel = f".cursor/agents/{role_name}.md"
+    spec_rel = f".cursor/agents/{role_name}.md" if (root / f".cursor/agents/{role_name}.md").exists() else "AGENTS.md"
 
     def _show_status():
         try:
@@ -1618,7 +1654,7 @@ def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: st
         print(f"│{empty_row:<70}│")
     print(ctext(f"└{border}┘\n", "cyan"))
 
-    runner = get_cli_runner() if not manual else None
+    runner = get_cli_runner(root) if not manual else None
     if runner:
         print(ctext(f"🚀 Executing via CLI runner: {' '.join(runner)} ...\n", "green"))
         rc, output_lines = execute_cli_runner(runner, full_prompt, root)
@@ -1635,7 +1671,7 @@ def dispatch_role(root: Path, task_id: str, tier: int, phase: str, role_name: st
             print(ctext("ℹ Manual mode active (--manual).", "dim"))
         else:
             print(ctext("ℹ CLI runner not configured (set HELM_CLI_CMD to auto-execute).", "dim"))
-        print(f"   Copy the prompt above into your AI agent or run " + ctext(slash_cmd, "cyan") + f" in Cursor IDE.\n")
+        print(f"   Copy the prompt above into your AI agent (or type " + ctext(slash_cmd, "cyan") + f" if supported by your IDE).\n")
         _show_status()
 
 
@@ -2240,11 +2276,30 @@ def discovered_skills(root):
     return found
 
 
+def active_skills_dir(root: Path) -> Path:
+    cfg = L.load_json(root / ".helm/config.json", {})
+    plats = cfg.get("platforms", [])
+    if "antigravity" in plats:
+        return root / ".agents/skills"
+    if "claude" in plats:
+        return root / ".claude/skills"
+    if "codex" in plats:
+        return root / ".codex/skills"
+    return root / ".cursor/skills"
+
+
 def skills_verify(root, quiet=False):
     lock = L.load_json(root / ".helm/skills.lock.json", {"skills": []})
     problems, approved = [], {}
+    s_dir = active_skills_dir(root)
     for s in lock.get("skills", []):
-        d = root / ".cursor/skills" / s["name"]
+        d = None
+        for cand in [s_dir, *[root / x for x in SKILL_DIRS]]:
+            if (cand / s["name"]).exists():
+                d = cand / s["name"]
+                break
+        if d is None:
+            d = s_dir / s["name"]
         approved[str(d)] = s
         if not d.is_dir():
             problems.append(f"approved skill missing on disk: {s['name']}")
@@ -2252,7 +2307,7 @@ def skills_verify(root, quiet=False):
             problems.append(f"HASH MISMATCH (modified since approval): {s['name']}")
     for path, (where, p) in discovered_skills(root).items():
         if path not in approved:
-            problems.append(f"UNAPPROVED skill that Cursor will discover ({where}): {path}")
+            problems.append(f"UNAPPROVED skill that AI agents will discover ({where}): {path}")
     if not quiet:
         print(f"{len(lock.get('skills', []))} approved skill(s)")
         for pr in problems:
@@ -2285,7 +2340,7 @@ def cmd_skills(a):
                     hits.append(f"{p.relative_to(src)}:{i}: {line.strip()[:110]}")
     print(f"Skill `{a.name}` from {a.source} @ {a.sha}")
     print("Risky-pattern hits (read each!):\n  " + ("\n  ".join(hits[:40]) if hits else "(none)"))
-    dest = root / ".cursor/skills" / a.name
+    dest = active_skills_dir(root) / a.name
     if dest.exists():
         die(f"{dest} already exists; remove it deliberately first")
     if not confirm(f"I have read this skill's files in full. Type '{a.name}' to vendor it: ", a.name):
@@ -2298,7 +2353,7 @@ def cmd_skills(a):
                            "files": files, "has_scripts": bool(bad_files)})
     L.dump_json(root / ".helm/skills.lock.json", lock)
     L.integrity_refresh(root, pol)
-    print(f"vendored to {dest.relative_to(root)} and locked. Commit both; CODEOWNERS should cover .cursor/ and .helm/.")
+    print(f"vendored to {dest.relative_to(root)} and locked. Commit both; CODEOWNERS should cover framework directories and .helm/.")
 
 
 # ---------------------------------------------------------------- doctor
@@ -2308,20 +2363,62 @@ def doctor_checks(root, pol):
     add("PASS" if sys.version_info >= (3, 9) else "FAIL", f"python {sys.version.split()[0]} (need ≥ 3.9)")
     add("PASS" if (L.key_path().exists() and (L.key_path().stat().st_mode & 0o077) == 0) else "FAIL",
         f"signing key {L.key_path()} exists with owner-only permissions" if L.key_path().exists() else "no signing key: run `helm init`")
-    hooks = L.load_json(root / ".cursor/hooks.json", {})
-    hk = (hooks or {}).get("hooks", {})
-    for ev in ("beforeShellExecution", "beforeMCPExecution", "preToolUse", "beforeReadFile", "subagentStart", "afterFileEdit"):
-        ent = [e for e in hk.get(ev, []) if "helm_guard.py" in e.get("command", "")]
-        if not ent:
-            add("FAIL", f"hooks.json: no HELM guard on `{ev}`")
-        elif ev != "afterFileEdit" and ev != "subagentStart" and not all(e.get("failClosed") is True for e in ent):
-            add("FAIL", f"hooks.json: `{ev}` guard is not failClosed:true (crash/timeout would FAIL OPEN)")
-        else:
-            add("PASS", f"hooks.json: `{ev}` wired")
-    cli = L.load_json(root / ".cursor/cli.json", {}) or {}
-    denies = (cli.get("permissions") or {}).get("deny", [])
-    add("PASS" if any("Shell(gh)" == d for d in denies) and any(d.startswith("Read(") for d in denies) else "WARN",
-        ".cursor/cli.json permissions deny-list present" if denies else ".cursor/cli.json deny-list missing (CLI second layer)")
+    cfg = L.load_json(root / ".helm/config.json", {})
+    platforms = cfg.get("platforms", [])
+    if not platforms:
+        if (root / ".agents").exists():
+            platforms.append("antigravity")
+        if (root / ".claude").exists():
+            platforms.append("claude")
+        if (root / ".codex").exists():
+            platforms.append("codex")
+        if (root / ".cursor").exists() or not platforms:
+            platforms.append("cursor")
+
+    add("INFO", f"configured AI platform(s): {', '.join(platforms)}")
+
+    if "antigravity" in platforms:
+        ag_hooks = L.load_json(root / ".agents/hooks.json", {})
+        ag_guard = ag_hooks.get("helm-guard", {})
+        pre_tool = ag_guard.get("PreToolUse", [])
+        wired = any(
+            any("helm_guard.py" in h.get("command", "") for h in entry.get("hooks", []))
+            for entry in pre_tool
+        )
+        add("PASS" if wired else "FAIL", ".agents/hooks.json: Antigravity PreToolUse guard wired" if wired else ".agents/hooks.json: missing helm_guard.py PreToolUse hook")
+        has_bin = any(shutil.which(b) for b in ("agy", "antigravity", "gemini"))
+        add("PASS" if has_bin else "WARN", "Antigravity CLI binary found on PATH" if has_bin else "No Antigravity CLI binary found (install agy for CLI runner)")
+
+    if "claude" in platforms:
+        cl_cfg = L.load_json(root / ".claude/settings.json", {})
+        cl_hooks = (cl_cfg.get("hooks") or {}).get("PreToolUse", [])
+        wired = any("helm_guard.py" in h.get("command", "") for h in cl_hooks)
+        add("PASS" if wired else "FAIL", ".claude/settings.json: Claude Code PreToolUse guard wired" if wired else ".claude/settings.json: missing helm_guard.py hook")
+
+    if "codex" in platforms:
+        cx_cfg = L.load_json(root / ".codex/hooks.json", {})
+        cx_hooks = (cx_cfg.get("hooks") or {}).get("PreToolUse", [])
+        wired = any(
+            any("helm_guard.py" in h.get("command", "") for h in entry.get("hooks", []))
+            for entry in cx_hooks
+        )
+        add("PASS" if wired else "FAIL", ".codex/hooks.json: OpenAI Codex PreToolUse guard wired" if wired else ".codex/hooks.json: missing helm_guard.py hook")
+
+    if "cursor" in platforms:
+        hooks = L.load_json(root / ".cursor/hooks.json", {})
+        hk = (hooks or {}).get("hooks", {})
+        for ev in ("beforeShellExecution", "beforeMCPExecution", "preToolUse", "beforeReadFile", "subagentStart", "afterFileEdit"):
+            ent = [e for e in hk.get(ev, []) if "helm_guard.py" in e.get("command", "")]
+            if not ent:
+                add("FAIL", f".cursor/hooks.json: no HELM guard on `{ev}`")
+            elif ev != "afterFileEdit" and ev != "subagentStart" and not all(e.get("failClosed") is True for e in ent):
+                add("FAIL", f".cursor/hooks.json: `{ev}` guard is not failClosed:true (crash/timeout would FAIL OPEN)")
+            else:
+                add("PASS", f".cursor/hooks.json: `{ev}` wired")
+        cli = L.load_json(root / ".cursor/cli.json", {}) or {}
+        denies = (cli.get("permissions") or {}).get("deny", [])
+        add("PASS" if any("Shell(gh)" == d for d in denies) and any(d.startswith("Read(") for d in denies) else "WARN",
+            ".cursor/cli.json permissions deny-list present" if denies else ".cursor/cli.json deny-list missing (CLI second layer)")
     gi = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", ".helm/work/x/WORK.md"]).returncode == 0
     add("PASS" if gi else "FAIL", ".helm/work/ is gitignored" if gi else ".helm/work/ is NOT gitignored (diff hash would be polluted)")
     ag = (root / "AGENTS.md").read_text(errors="replace") if (root / "AGENTS.md").exists() else ""
@@ -2344,7 +2441,8 @@ def doctor_checks(root, pol):
     add("PASS" if ov["present"] else "WARN", "repo overlay present" + (f" (STALE: {len(ov['stale_files'])} watched files changed)" if ov.get("stale_files") else "") if ov["present"] else "no repo overlay yet: `helm bootstrap start`")
     co = [root / "CODEOWNERS", root / ".github/CODEOWNERS", root / "docs/CODEOWNERS"]
     cot = "".join(p.read_text(errors="replace") for p in co if p.exists())
-    add("PASS" if ".cursor" in cot and ".helm" in cot else "WARN", "CODEOWNERS covers .cursor/ and .helm/" if (".cursor" in cot and ".helm" in cot) else "CODEOWNERS does not cover .cursor/ and .helm/ (framework changes unreviewed)")
+    covers_framework = any(p in cot for p in (".cursor", ".agents", ".claude", ".codex")) and ".helm" in cot
+    add("PASS" if covers_framework else "WARN", "CODEOWNERS covers framework directories and .helm/" if covers_framework else "CODEOWNERS does not cover framework directories (framework changes unreviewed)")
     add("INFO", "managed hooks at /etc/cursor/hooks.json: " + ("present" if Path("/etc/cursor/hooks.json").exists() else "absent (project hooks are agent-reachable only via protected-path rules; ask IT for managed hooks)"))
     fails = G.selftest(root)
     add("PASS" if not fails else "FAIL", f"guard policy self-test: {len(G.SELFTEST)} cases" if not fails else "guard self-test failures: " + " | ".join(fails[:3]))
@@ -2352,24 +2450,24 @@ def doctor_checks(root, pol):
 
 
 def live_check(root):
-    cli = shlex.split(os.environ.get("HELM_CLI_CMD", "cursor-agent -p --force --trust"))
-    if not shutil.which(cli[0]):
-        return [("FAIL", f"`{cli[0]}` not on PATH (set HELM_CLI_CMD to your Cursor CLI invocation)")]
+    cli = get_cli_runner(root)
+    if not cli:
+        return [("FAIL", "No AI CLI runner found on PATH (set HELM_CLI_CMD or install agy, claude, codex, or cursor-agent)")]
+    bin_name = os.path.basename(cli[0])
     res = []
-    for label, tmpl in (("main-agent", "Run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}"),
-                        ("subagent", "Use a subagent (Task tool) to run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}")):
+    for label, tmpl in (("main-agent", "Run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}"),):
         n = secrets.token_hex(4) + label[:3]
         try:
             subprocess.run(cli + [tmpl.format(n=n)], cwd=root, capture_output=True, text=True, timeout=240)
         except Exception as e:
-            res.append(("FAIL", f"{label}: could not run CLI ({e})"))
+            res.append(("FAIL", f"{bin_name}: could not run CLI ({e})"))
             continue
         seen = False
         p = L.state_dir(root) / "audit" / "_doctor.jsonl"
         if p.exists():
             seen = any(f"\"nonce\": \"{n}\"" in line for line in p.read_text().splitlines())
-        res.append(("PASS" if seen else "FAIL", f"{label}: hook fired and denied the canary" if seen else
-                    f"{label}: hooks did NOT fire (canary never reached the guard) — enforcement is NOT active on this route"))
+        res.append(("PASS" if seen else "FAIL", f"{bin_name}: hook fired and denied the canary" if seen else
+                    f"{bin_name}: hooks did NOT fire (canary never reached the guard) — enforcement is NOT active on this route"))
     return res
 
 

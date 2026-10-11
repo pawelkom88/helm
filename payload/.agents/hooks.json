@@ -1,0 +1,16 @@
+{
+  "helm-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .helm/bin/helm_guard.py tool --platform antigravity",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

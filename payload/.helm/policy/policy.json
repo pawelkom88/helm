@@ -2,6 +2,9 @@
   "version": 1,
   "protected_paths": [
     ".cursor/**",
+    ".agents/**",
+    ".claude/**",
+    ".codex/**",
     ".helm/bin/**",
     ".helm/policy/**",
     ".helm/templates/**",
@@ -9,6 +12,7 @@
     ".helm/skills.lock.json",
     ".helm/VERSION",
     "AGENTS.md",
+    "GEMINI.md",
     "CLAUDE.md",
     "CODEOWNERS",
     ".github/CODEOWNERS",

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "command": "python3 .helm/bin/helm_guard.py shell --platform claude"
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "command": "python3 .helm/bin/helm_guard.py tool --platform claude"
+      }
+    ]
+  }
+}

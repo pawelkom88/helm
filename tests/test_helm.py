@@ -76,7 +76,8 @@ class Base(unittest.TestCase):
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         self.env = dict(os.environ, HELM_HOME=str(self.home), CURSOR_PROJECT_DIR=str(self.repo),
-                        HELM_SYSTEM_POLICY=str(self.tmp / "none.json"), HOME=str(self.tmp / "uhome"))
+                        HELM_SYSTEM_POLICY=str(self.tmp / "none.json"), HOME=str(self.tmp / "uhome"),
+                        HELM_CLI_CMD="off")
         (self.tmp / "uhome").mkdir()
         self._saved_env = {k: os.environ.get(k) for k in ("HELM_HOME", "HELM_SYSTEM_POLICY")}
         os.environ["HELM_HOME"] = str(self.home)
@@ -968,8 +969,8 @@ class TestInteractiveCLI(Base):
         self.assertIn("Continue in Local Story Mode", out)
         self.assertIn("configure .cursor/mcp.json and re-run `helm start`", out)
 
-        # 2. Declining setup ('n') and accepting Local Story Mode ('y') proceeds and saves STORY.md
-        code, out = self.tty_run("start", lines=["n", "y", "INT-1", "Implement reusable filter", "1", "8"])
+        # 2. Declining setup ('n') and accepting Local Story Mode ('y') proceeds, saves STORY.md, and auto-launches helm work
+        code, out = self.tty_run("start", lines=["n", "y", "INT-1", "Implement reusable filter", "1", "8", "1"])
         self.assertEqual(code, 0, out)
         self.assertIn("Atlassian MCP is not connected in .cursor/mcp.json", out)
         self.assertIn("Do you want to set it up now? [Y/n]:", out)
@@ -977,15 +978,25 @@ class TestInteractiveCLI(Base):
         self.assertIn("Enter Task / Jira ID", out)
         self.assertIn("Tier 1 — Quick / Small", out)
         self.assertIn("Task INT-1 registered", out)
+        self.assertIn("Auto-starting Discovery (`helm work`)", out)
+        self.assertIn("HELM Agent Dispatch: DISCOVERY", out)
         self.assertEqual((self.repo / ".helm/work/INT-1/STORY.md").read_text().strip(), "Implement reusable filter")
         st = self.status()
         self.assertEqual(st.get("active"), "INT-1")
         self.assertEqual(st.get("tier"), 1)
         self.tty_run("abort", lines=["INT-1"])
 
+        # 2b. Empty newlines or invalid inputs at tier prompt do NOT auto-select Tier 1; explicit '2' selects Tier 2
+        code, out = self.tty_run("start", lines=["n", "y", "INT-TIER2", "Story text", "", "3", "2", "8", "1"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("Invalid choice. Please enter 1 (Tier 1) or 2 (Tier 2).", out)
+        self.assertIn("Task INT-TIER2 registered (Tier 2: Deep Governance (Multi-Gate))", out)
+        self.assertEqual(self.status().get("tier"), 2)
+        self.tty_run("abort", lines=["INT-TIER2"])
+
         # 3. Missing .cursor/mcp.json is auto-initialized during helm start pre-flight (and 's' skips setup verification to Local Story Mode)
         (self.repo / ".cursor/mcp.json").unlink()
-        code, out = self.tty_run("start", lines=["y", "s", "INT-MCP", "", "1", "8"])
+        code, out = self.tty_run("start", lines=["y", "s", "INT-MCP", "", "1", "8", "1"])
         self.assertEqual(code, 0, out)
         self.assertTrue((self.repo / ".cursor/mcp.json").exists())
         self.assertIn("Initialized .cursor/mcp.json", out)
@@ -993,7 +1004,7 @@ class TestInteractiveCLI(Base):
 
         # 4. Dirty working tree allows starting without prompt or error
         (self.repo / "src/app.ts").write_text("export const a = 99;\n")
-        code, out = self.tty_run("start", lines=["n", "y", "INT-2", "", "1", "8"])
+        code, out = self.tty_run("start", lines=["n", "y", "INT-2", "", "1", "8", "1"])
         self.assertEqual(code, 0, out)
         self.assertNotIn("Uncommitted changes detected in working tree.", out)
         self.assertNotIn("Allow starting with uncommitted changes?", out)
@@ -1090,7 +1101,7 @@ for line in sys.stdin:
         os.write(fd, b"\n")
 
         read_until("Enter Task / Jira ID")
-        os.write(fd, b"PROJ-10\n1\n8\n")
+        os.write(fd, b"PROJ-10\n1\n8\n1\n")
 
         while True:
             try:
@@ -1196,13 +1207,15 @@ for line in sys.stdin:
         # 3. Selection: "2" (Pick PROJ-51)
         # 4. Tier: "1"
         # 5. Branch: "8" (skip)
-        code, out = self.tty_run("start", lines=["TYPO-99", "1", "2", "1", "8"])
+        # 6. Model: "1" (default Discovery model)
+        code, out = self.tty_run("start", lines=["TYPO-99", "1", "2", "1", "8", "1"])
         self.assertEqual(code, 0, out)
         self.assertIn("Could not verify ticket 'TYPO-99'", out)
         self.assertIn("Available Jira Tickets:", out)
         self.assertIn("PROJ-51", out)
         self.assertIn("Selected 'PROJ-51': Implement Bulk Status Update", out)
         self.assertIn("Task PROJ-51 registered", out)
+        self.assertIn("Auto-starting Discovery (`helm work`)", out)
         self.tty_run("abort", lines=["PROJ-51"])
 
     def test_interactive_approve_auto_detects_phase(self):
@@ -1900,13 +1913,13 @@ class TestMultiPlatform(Base):
         sh("git", "checkout", "-q", "-b", "develop", cwd=self.repo)
 
         # 1. Zero-friction branch creation (Category 1: feat, Description: "new feature")
-        # Inputs: "n" (skip MCP setup), "y" (Local Story Mode), "1" (Category feat), "new feature" (Description)
+        # Inputs: "n" (skip MCP setup), "y" (Local Story Mode), "1" (Category feat), "new feature" (Description), "1" (Discovery model)
         code, out = self.tty_run("start", "BR-1", "--tier", "1", "--story", "desc", "--allow-dirty",
-                                 lines=["n", "y", "1", "new feature"])
+                                 lines=["n", "y", "1", "new feature", "1"])
         self.assertEqual(code, 0, out)
         self.assertIn("Created and switched to branch: feat/BR-1-new-feature", out)
         self.assertNotIn("? Create and checkout branch", out)
-        self.assertIn("Run helm work", out)
+        self.assertIn("Auto-starting Discovery (`helm work`)", out)
         self.assertNotIn("helm work BR-1", out)
         snap = L.git_snapshot(self.repo)
         self.assertEqual(snap["branch"], "feat/BR-1-new-feature")
@@ -1915,9 +1928,9 @@ class TestMultiPlatform(Base):
         # 2. Existing branch collision handling - Option 1: Switch to existing branch
         sh("git", "checkout", "-q", "develop", cwd=self.repo)
         # Attempt to start task BR-1 again with same description "new feature"
-        # Prompt will detect feat/BR-1-new-feature already exists -> choose "1" (Switch)
+        # Prompt will detect feat/BR-1-new-feature already exists -> choose "1" (Switch), "1" (Discovery model)
         code, out = self.tty_run("start", "BR-1", "--tier", "1", "--story", "desc", "--allow-dirty",
-                                 lines=["n", "y", "1", "new feature", "1"])
+                                 lines=["n", "y", "1", "new feature", "1", "1"])
         self.assertEqual(code, 0, out)
         self.assertIn("Branch 'feat/BR-1-new-feature' already exists", out)
         self.assertIn("Switched to existing branch: feat/BR-1-new-feature", out)
@@ -1927,9 +1940,9 @@ class TestMultiPlatform(Base):
 
         # 3. Existing branch collision handling - Option 2: Rename
         sh("git", "checkout", "-q", "develop", cwd=self.repo)
-        # Inputs: "n", "y", "1", "new feature" -> exists -> "2" (Rename) -> "second attempt"
+        # Inputs: "n", "y", "1", "new feature" -> exists -> "2" (Rename) -> "second attempt", "1" (Discovery model)
         code, out = self.tty_run("start", "BR-1", "--tier", "1", "--story", "desc", "--allow-dirty",
-                                 lines=["n", "y", "1", "new feature", "2", "second attempt"])
+                                 lines=["n", "y", "1", "new feature", "2", "second attempt", "1"])
         self.assertEqual(code, 0, out)
         self.assertIn("Branch 'feat/BR-1-new-feature' already exists", out)
         self.assertIn("Created and switched to branch: feat/BR-1-second-attempt", out)

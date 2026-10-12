@@ -1807,10 +1807,20 @@ def cmd_start(a):
     if getattr(a, "tier", None) is None:
         if is_interactive():
             print("\nSelect workflow tier:")
-            print("  [1] Tier 1 — Quick / Small (Brief + Plan merged into WORK.md, 1 upfront gate) [Default]")
+            print("  [1] Tier 1 — Quick / Small (Brief + Plan merged into WORK.md, 1 upfront gate)")
             print("  [2] Tier 2 — Standard / Complex (Discovery → Plan → Test Plan → Implement → Full Review)")
-            ans = prompt_user("? Choose tier [1/2] (1): ").strip()
-            a.tier = 2 if ans == "2" else 1
+            empty_count = 0
+            while True:
+                ans = prompt_user("? Choose tier [1/2]: ").strip()
+                if ans in ("1", "2"):
+                    a.tier = int(ans)
+                    break
+                if ans:
+                    print(cwarn("Invalid choice. Please enter 1 (Tier 1) or 2 (Tier 2)."))
+                else:
+                    empty_count += 1
+                    if empty_count > 10:
+                        die("tier selection required (enter 1 or 2)")
         else:
             a.tier = 2
 
@@ -1894,6 +1904,13 @@ def cmd_start(a):
     print(ctext(f"  • Workspace     : {L.WORK_REL}/{a.id}/", "dim"))
     if story_input:
         print(ctext(f"  • Story File    : {L.WORK_REL}/{a.id}/STORY.md", "dim"))
+
+    if is_interactive() and not getattr(a, "no_work", False):
+        print("\n" + ctext("👉 Auto-starting Discovery (`helm work`)...", "bold"))
+        a.story = None
+        cmd_work(a)
+        return
+
     print("\n" + ctext("👉 Next Step (AI Agent Turn):", "bold"))
     if "cursor" in platforms and "antigravity" not in platforms and "claude" not in platforms and "codex" not in platforms:
         print(f"   Run " + ctext("helm work", "cyan") + " (or in Cursor: " + ctext(f"/work {a.id}", "cyan") + ")")
@@ -3923,6 +3940,10 @@ def main():
     s.add_argument("--story", default=None, help="Story or requirements description")
     s.add_argument("--platform", choices=["cursor", "antigravity", "claude", "codex", "all"], default=None, help="Target AI agent platform")
     s.add_argument("--ag", dest="platform_ag", action="store_true", help="Shortcut for --platform antigravity")
+    s.add_argument("--model", default=None, help="Model override for discovery phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
+    s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
+    s.add_argument("--manual", action="store_true", help="Print discovery prompt only without auto-executing CLI runner")
+    s.add_argument("--no-work", dest="no_work", action="store_true", help="Register task only without auto-launching discovery (helm work)")
     s.set_defaults(f=cmd_start)
 
     s = sp.add_parser("work", help="Dispatch discovery procedure / start task work")

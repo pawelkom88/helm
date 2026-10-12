@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 sys.dont_write_bytecode = True  # never leave untracked .pyc in the workspace
+import ipaddress
 import json
 import os
 import re
@@ -71,7 +72,7 @@ OTHER_PM = {"pip": {"install", "uninstall"}, "pip3": {"install", "uninstall"}, "
             "cargo": {"add", "install", "publish", "remove"}, "gem": {"install", "push"},
             "composer": {"require", "remove"}, "dotnet": {"add", "publish", "nuget"}, "uv": {"add", "remove", "publish"}}
 
-READ_TOOLS = {"read", "readfile", "grep", "glob", "globfilesearch", "ls", "listdir", "listdirectory", "readlints",
+READ_TOOLS = {"read", "readfile", "viewfile", "grep", "glob", "globfilesearch", "ls", "listdir", "listdirectory", "readlints",
               "semanticsearch", "codebasesearch", "filesearch", "search", "todowrite", "askquestion", "switchmode",
               "createplan", "readnotebook", "notebookread"}
 DELETE_TOOLS = {"delete", "deletefile", "removefile", "remove"}
@@ -462,6 +463,98 @@ def _find_url(obj):
     return ""
 
 
+BLOCKED_HOST_SUFFIXES = (
+    ".localhost", ".local", ".internal", ".home.arpa", ".corp", ".lan",
+    ".nip.io", ".sslip.io", ".xip.io", ".lvh.me", ".traefik.me",
+)
+BLOCKED_EXACT_HOSTS = {
+    "localhost", "instance-data", "metadata.google.internal", "metadata.goog",
+    "kubernetes.default", "kubernetes.default.svc", "kubernetes.default.svc.cluster.local",
+}
+
+def _parse_ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not host:
+        return None
+    h = host.strip("[]")
+    try:
+        return ipaddress.ip_address(h)
+    except ValueError:
+        pass
+
+    if h.isdigit():
+        try:
+            val = int(h)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+        except ValueError:
+            pass
+
+    if h.lower().startswith("0x"):
+        try:
+            val = int(h, 16)
+            if 0 <= val <= 0xFFFFFFFF:
+                return ipaddress.IPv4Address(val)
+        except ValueError:
+            pass
+
+    if "." in h:
+        parts = h.split(".")
+        if len(parts) == 4:
+            try:
+                def _parse_part(p: str) -> int:
+                    p = p.strip()
+                    if p.lower().startswith("0x"):
+                        return int(p, 16)
+                    if p.startswith("0") and len(p) > 1 and all(c in "01234567" for c in p):
+                        return int(p, 8)
+                    return int(p, 10)
+
+                nums = [_parse_part(p) for p in parts]
+                if all(0 <= n <= 255 for n in nums):
+                    val = (nums[0] << 24) | (nums[1] << 16) | (nums[2] << 8) | nums[3]
+                    return ipaddress.IPv4Address(val)
+            except ValueError:
+                pass
+
+    return None
+
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+NAT64_NET = ipaddress.ip_network("64:ff9b::/96")
+
+
+def is_ssrf_blocked(url_or_parsed) -> tuple[bool, str]:
+    u = urlparse(url_or_parsed) if isinstance(url_or_parsed, str) else url_or_parsed
+    if getattr(u, "username", None) or getattr(u, "password", None):
+        return True, "SSRF guard: credentials in URL are blocked"
+    host = (getattr(u, "hostname", "") or "").lower()
+    if not host:
+        return False, ""
+
+    if host in BLOCKED_EXACT_HOSTS or any(host.endswith(s) for s in BLOCKED_HOST_SUFFIXES):
+        return True, f"SSRF guard: target hostname `{host}` is internal, loopback, or metadata"
+
+    ip = _parse_ip_literal(host)
+    if ip is not None:
+        if ip.version == 6:
+            if ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            elif ip in NAT64_NET:
+                ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+            or (ip.version == 4 and ip in CGNAT_NET)
+        ):
+            return True, f"SSRF guard: target IP `{ip}` is private, loopback, or metadata"
+
+    return False, ""
+
+
 def h_web(name, inp, ctx):
     w = ctx.pol.get("web") or {}
     if name in ("websearch", "searchweb"):
@@ -471,6 +564,10 @@ def h_web(name, inp, ctx):
     host = (u.hostname or "").lower()
     if u.scheme != "https" or not host:
         return deny("web fetch needs an https URL")
+    blocked, reason = is_ssrf_blocked(u)
+    if blocked:
+        L.audit(ctx.root, ctx.task, {"k": "web_denied", "h": host, "why": reason})
+        return deny(reason)
     domains = w.get("fetch_domains") or []
     if "*" in domains or any(isinstance(d, str) and (host == d or host.endswith("." + d)) for d in domains):
         L.audit(ctx.root, ctx.task, {"k": "web", "h": host})
@@ -494,11 +591,17 @@ def h_tool(p, ctx):
     cwd = p.get("cwd") or ctx.cwd
     if name in READ_TOOLS:
         for pp in paths:
-            c = L.classify(ctx.root, ctx.pol, L.resolve(ctx.root, pp, cwd))
+            q = L.resolve(ctx.root, pp, cwd)
+            c = L.classify(ctx.root, ctx.pol, q)
             if c["secret"] or c["state"]:
                 return deny(f"reading `{pp}` is not allowed (secret/state path)")
             if c["rel"] is not None:
-                L.audit(ctx.root, ctx.task, {"k": "read", "p": c["rel"]})
+                b = 0
+                try:
+                    b = q.stat().st_size
+                except OSError:
+                    pass
+                L.audit(ctx.root, ctx.task, {"k": "read", "p": c["rel"], "bytes": b})
         return allow()
     is_write = name in WRITE_TOOLS or (bool(paths) and name not in READ_TOOLS)
     if not is_write:
@@ -515,6 +618,8 @@ def h_tool(p, ctx):
             L.audit(ctx.root, ctx.task, {"k": "write_denied", "p": pp, "why": why})
             return deny(f"write to `{pp}` not allowed: {why}")
         c = L.classify(ctx.root, ctx.pol, q)
+        if c["rel"] is not None:
+            L.audit(ctx.root, ctx.task, {"k": "write", "p": c["rel"]})
         if ctx.task and c["rel"] and c["rel"].endswith(f"{L.WORK_REL}/{ctx.task}/BLOCKED.md") and name not in DELETE_TOOLS:
             L.append_record(ctx.root, ctx.task, {"gate": "block", "decision": "raise", "note": "agent wrote BLOCKED.md"})
     return allow()
@@ -524,9 +629,17 @@ def h_read(p, ctx):
     fp = p.get("file_path") or p.get("path") or ""
     if not fp:
         return allow()
-    c = L.classify(ctx.root, ctx.pol, L.resolve(ctx.root, fp, ctx.cwd))
+    q = L.resolve(ctx.root, fp, ctx.cwd)
+    c = L.classify(ctx.root, ctx.pol, q)
     if c["secret"] or c["state"]:
         return deny(f"reading `{fp}` is not allowed (secret/state path)")
+    if c["rel"] is not None:
+        b = 0
+        try:
+            b = q.stat().st_size
+        except OSError:
+            pass
+        L.audit(ctx.root, ctx.task, {"k": "read", "p": c["rel"], "bytes": b})
     return allow()
 
 
@@ -572,7 +685,9 @@ def h_postedit(p, ctx):
         wd = i["work_dir"]
         if rel.startswith(L.WORK_REL + "/"):
             name = rel[len(wd) + 1:] if rel.startswith(wd + "/") else None
-            if name is None or not (name in L.ARTIFACT_FILES or re.fullmatch(r"REVIEW-[\w.-]+\.md", name)):
+            if name == "DIFF-DIGEST.md":
+                why = "edit to read-only DIFF-DIGEST.md"
+            elif name is None or not (name in L.ARTIFACT_FILES or re.fullmatch(r"REVIEW-[\w.-]+\.md", name)):
                 why = "edit to an unexpected work-dir path"
         elif not L.write_scope(ctx.root, ctx.pol, i)["source"] and not (
                 i["phase"] == "TEST_ANALYSIS" and L.any_match(ctx.pol.get("test_globs", []), rel)):
@@ -656,7 +771,10 @@ def format_egress(platform: str, out: dict) -> tuple[dict, int]:
     if platform == "antigravity":
         if is_deny:
             return {"decision": "deny", "reason": reason}, 0
-        return {"decision": "allow"}, 0
+        res = {"decision": "allow"}
+        if out.get("permissionOverrides"):
+            res["permissionOverrides"] = out["permissionOverrides"]
+        return res, 0
 
     if platform == "claude_codex":
         if is_deny:
@@ -731,7 +849,12 @@ SELFTEST = [
     ("read", {"file_path": ".env"}, False), ("read", {"file_path": "src/index.ts"}, True),
     ("tool", {"tool_name": "Read", "tool_input": {"path": "id_rsa"}}, False),
     ("tool", {"tool_name": "Write", "tool_input": {"path": ".cursor/hooks.json"}}, False),
+    ("tool", {"tool_name": "Write", "tool_input": {"path": ".helm/work/T-1/DIFF-DIGEST.md"}}, False),
     ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "http://evil.example/x"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://169.254.169.254/latest/meta-data/"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://127.0.0.1:8080/admin"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://localhost/api"}}, False),
+    ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://metadata.google.internal/computeMetadata/v1/"}}, False),
     ("tool", {"tool_name": "WebFetch", "tool_input": {"url": "https://example.com/docs"}}, True),
     ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git commit -m x"}}}, False),
     ("tool", {"toolCall": {"name": "run_command", "args": {"CommandLine": "git status"}}}, True),

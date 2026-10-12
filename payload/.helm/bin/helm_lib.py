@@ -23,8 +23,171 @@ FRAMEWORK_VERSION = "1.0.0"
 WORK_REL = ".helm/work"
 BOOT_REL = ".helm/bootstrap/proposal"
 OVERLAY_REL = ".helm/repo"
-ARTIFACT_FILES = ["WORK.md", "PLAN.md", "TEST-PLAN.md", "IMPL.md", "REVIEW.md", "BLOCKED.md"]
+ARTIFACT_FILES = ["WORK.md", "PLAN.md", "TEST-PLAN.md", "IMPL.md", "REVIEW.md", "BLOCKED.md", "DIFF-DIGEST.md"]
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+VERIFY_ERROR_RE = re.compile(
+    r"(?:\bFAIL(?:ED|URE)?\b|\bERROR\b|Traceback \(most recent call last\):|"
+    r"\b(?:AssertionError|Exception|RuntimeError|ValueError|TypeError|KeyError|SyntaxError|ImportError)\b|"
+    r"^E\s+|File \".+\", line \d+|\berror(?:\[E\d+\]|\s+TS\d+|:)|\bpanic:|✘|×)",
+    re.MULTILINE,
+)
+
+ROLE_STEERING = {
+    "discovery": {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "concise"},
+    "planner": {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "detailed"},
+    "test-analyst": {"model": "claude-haiku-5-5", "reasoning_effort": "medium", "verbosity": "concise"},
+    "implementer": {"model": "claude-haiku-5-5", "reasoning_effort": "medium", "verbosity": "concise"},
+    "reviewer": {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "thorough"},
+    "specialist-reviewer": {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "thorough"},
+    "bootstrapper": {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "detailed"},
+}
+
+
+def get_role_steering(role_name: str, pol: dict | None = None) -> dict[str, str]:
+    pol = pol or {}
+    pol_steering = (pol.get("steering") or {}).get(role_name, {})
+    default = ROLE_STEERING.get(role_name, {"model": "claude-opus-5-5", "reasoning_effort": "medium", "verbosity": "concise"})
+    return {
+        "model": pol_steering.get("model", default.get("model", "claude-opus-5-5")),
+        "reasoning_effort": pol_steering.get("reasoning_effort", default.get("reasoning_effort", "medium")),
+        "verbosity": pol_steering.get("verbosity", default.get("verbosity", "concise")),
+    }
+
+
+def estimate_tokens_from_bytes(n: int) -> int:
+    return (max(0, int(n)) + 3) // 4
+
+
+def compress_verify_log(
+    raw: str,
+    raw_log_rel: str,
+    max_lines: int = 120,
+    head: int = 15,
+    tail: int = 25,
+    before: int = 3,
+    after: int = 8,
+) -> dict:
+    raw_str = raw or ""
+    raw_bytes = len(raw_str.encode("utf-8", "replace"))
+    raw_tokens = estimate_tokens_from_bytes(raw_bytes)
+
+    raw_lines_list: list[str] = []
+    split_lines = raw_str.split("\n")
+    if split_lines and split_lines[-1] == "":
+        split_lines.pop()
+    for line in split_lines:
+        if line.endswith("\r"):
+            line = line[:-1]
+        if "\r" in line:
+            parts = [p for p in line.split("\r") if p]
+            line = parts[-1] if parts else ""
+        raw_lines_list.append(ANSI_ESCAPE_RE.sub("", line))
+
+    raw_line_count = len(raw_lines_list)
+    if raw_line_count == 0:
+        return {
+            "text": "",
+            "raw_lines": 0,
+            "compressed_lines": 0,
+            "raw_tokens": 0,
+            "compressed_tokens": 0,
+            "saved_tokens": 0,
+            "raw_log": raw_log_rel,
+        }
+
+    collapsed: list[tuple[int, int, str, bool]] = []
+    i = 0
+    while i < raw_line_count:
+        line_text = raw_lines_list[i]
+        start_line = i + 1
+        j = i + 1
+        while j < raw_line_count and raw_lines_list[j] == line_text:
+            j += 1
+        run_len = j - i
+        collapsed.append((start_line, start_line, line_text, False))
+        if run_len > 1:
+            collapse_note = f"... [collapsed {run_len - 1} identical lines] ..."
+            collapsed.append((start_line + 1, j, collapse_note, True))
+        i = j
+
+    total_collapsed = len(collapsed)
+    if total_collapsed <= max_lines:
+        keep_indices = set(range(total_collapsed))
+    else:
+        keep_indices = set()
+        for idx in range(min(head, total_collapsed)):
+            keep_indices.add(idx)
+        for idx in range(max(0, total_collapsed - tail), total_collapsed):
+            keep_indices.add(idx)
+        error_indices = []
+        for idx, (_, _, text, _) in enumerate(collapsed):
+            if VERIFY_ERROR_RE.search(text):
+                for k in range(max(0, idx - before), min(total_collapsed, idx + after + 1)):
+                    error_indices.append(k)
+
+        avail_for_errors = max(0, max_lines - len(keep_indices))
+        unique_error_indices = sorted(set(error_indices) - keep_indices)
+        for idx in unique_error_indices[:avail_for_errors]:
+            keep_indices.add(idx)
+
+    result_lines: list[str] = []
+    idx = 0
+    while idx < total_collapsed:
+        if idx in keep_indices:
+            result_lines.append(collapsed[idx][2])
+            idx += 1
+        else:
+            gap_start = idx
+            while idx < total_collapsed and idx not in keep_indices:
+                idx += 1
+            gap_end = idx - 1
+            orig_start = collapsed[gap_start][0]
+            orig_end = collapsed[gap_end][1]
+            omitted_count = orig_end - orig_start + 1
+            result_lines.append(
+                f"[... CCR: omitted {omitted_count} low-signal lines -> {raw_log_rel}#L{orig_start}-L{orig_end} ...]"
+            )
+
+    temp_text = "\n".join(result_lines)
+    temp_bytes = len(temp_text.encode("utf-8", "replace"))
+    pre_saved = max(0, raw_tokens - estimate_tokens_from_bytes(temp_bytes))
+    footer = f"[CCR: Compressed {raw_line_count} -> {len(result_lines) + 1} lines (~{pre_saved} tokens saved). Full log: {raw_log_rel}]"
+    result_lines.append(footer)
+
+    final_text = "\n".join(result_lines) + "\n"
+    final_bytes = len(final_text.encode("utf-8", "replace"))
+    compressed_tokens = estimate_tokens_from_bytes(final_bytes)
+    saved_tokens = max(0, raw_tokens - compressed_tokens)
+
+    if saved_tokens != pre_saved:
+        result_lines[-1] = f"[CCR: Compressed {raw_line_count} -> {len(result_lines)} lines (~{saved_tokens} tokens saved). Full log: {raw_log_rel}]"
+        final_text = "\n".join(result_lines) + "\n"
+        final_bytes = len(final_text.encode("utf-8", "replace"))
+        compressed_tokens = estimate_tokens_from_bytes(final_bytes)
+        saved_tokens = max(0, raw_tokens - compressed_tokens)
+
+    return {
+        "text": final_text,
+        "raw_lines": raw_line_count,
+        "compressed_lines": len(result_lines),
+        "raw_tokens": raw_tokens,
+        "compressed_tokens": compressed_tokens,
+        "saved_tokens": saved_tokens,
+        "raw_log": raw_log_rel,
+    }
+
+
+def store_ccr_log(wd: Path, check_name: str, raw_output: str, root: Path | None = None) -> dict:
+    vdir = wd / "verify"
+    vdir.mkdir(parents=True, exist_ok=True)
+    raw_path = vdir / f"{check_name}.raw.log"
+    log_path = vdir / f"{check_name}.log"
+    raw_path.write_text(raw_output or "", encoding="utf-8")
+    raw_log_rel = f"verify/{check_name}.raw.log"
+    res = compress_verify_log(raw_output or "", raw_log_rel)
+    log_path.write_text(res["text"], encoding="utf-8")
+    return res
 
 
 # --------------------------------------------------------------------------- basics
@@ -319,7 +482,7 @@ def classify(root, pol, q: Path) -> dict:
 
 PATH_KEYS = {"path", "filepath", "targetfile", "file", "filename", "notebookpath", "targetnotebook",
              "directory", "targetdirectory", "dir", "paths", "files", "oldpath", "newpath",
-             "source", "destination"}
+             "source", "destination", "absolutepath"}
 PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.M)
 
 
@@ -898,6 +1061,8 @@ def check_write(root, pol, rel_or_path, active, tampered, info=None, is_delete=F
     if c["outside"]:
         return (True, "") if is_tmp(q) else (False, "path is outside the repository")
     rel = c["rel"]
+    if rel.endswith("/DIFF-DIGEST.md") or rel == "DIFF-DIGEST.md":
+        return False, "DIFF-DIGEST.md is generated by HELM and read-only for agents"
     if c["protected"]:
         return False, "protected framework/config path — the human edits these directly"
     if tampered:
@@ -926,3 +1091,574 @@ def check_write(root, pol, rel_or_path, active, tampered, info=None, is_delete=F
     if sc["source"]:
         return True, ""
     return False, f"phase {info['phase']}: repository writes are not allowed in this phase"
+
+
+# --------------------------------------------------------------------------- metrics & waste signals
+def section_paths(text: str) -> set[str]:
+    found = set(re.findall(r"`([^`\s]+)`", text or ""))
+    found |= set(re.findall(r"^[-*]\s+([^\s`]+/[^\s`]*|[^\s`]+\.[A-Za-z0-9]+)\s*$", text or "", re.M))
+    return {f.rstrip("/") for f in found if f}
+
+
+def is_planned(f: str, planned: set[str]) -> bool:
+    return any(f == p or f.startswith(p + "/") for p in planned)
+
+
+def compute_task_metrics(root: Path, task: str, pol: dict | None = None) -> dict:
+    root = Path(root)
+    audit_file = state_dir(root) / "audit" / f"{task}.jsonl"
+    ev = []
+    if audit_file.exists():
+        for line in audit_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                ev.append(json.loads(line))
+            except ValueError:
+                continue
+
+    wd = root / WORK_REL / task
+    planned_paths = set()
+    if (wd / "WORK.md").exists():
+        try:
+            _, wbody = read_meta(wd / "WORK.md")
+            planned_paths |= section_paths(section(wbody, "Relevant Files"))
+            planned_paths |= section_paths(section(wbody, "Scope"))
+        except Exception:
+            pass
+    if (wd / "PLAN.md").exists():
+        try:
+            _, pbody = read_meta(wd / "PLAN.md")
+            planned_paths |= section_paths(section(pbody, "Files Likely To Change"))
+            planned_paths |= section_paths(section(pbody, "Plan"))
+        except Exception:
+            pass
+
+    read_events = [e for e in ev if e.get("k") == "read"]
+    reads_by_path: dict[str, int] = {}
+    bytes_by_path: dict[str, int] = {}
+
+    in_scope_reads = 0
+    in_scope_tokens = 0
+    out_of_scope_reads = 0
+    out_of_scope_tokens = 0
+    framework_reads = 0
+    framework_tokens = 0
+
+    for e in read_events:
+        p = e.get("p") or ""
+        reads_by_path[p] = reads_by_path.get(p, 0) + 1
+        b = e.get("bytes")
+        if b is None or b == 0:
+            try:
+                b = (root / p).stat().st_size
+            except OSError:
+                b = 0
+        b_int = int(b) if b is not None else 0
+        bytes_by_path[p] = max(bytes_by_path.get(p, 0), b_int)
+        tok = estimate_tokens_from_bytes(b_int)
+
+        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
+        if is_framework:
+            framework_reads += 1
+            framework_tokens += tok
+        elif is_planned(p, planned_paths):
+            in_scope_reads += 1
+            in_scope_tokens += tok
+        else:
+            out_of_scope_reads += 1
+            out_of_scope_tokens += tok
+
+    total_read_tokens = in_scope_tokens + out_of_scope_tokens + framework_tokens
+
+    task_artifacts_written_tokens = 0
+    task_artifacts_count = 0
+    if wd.exists():
+        for p in wd.rglob("*"):
+            if p.is_file():
+                task_artifacts_count += 1
+                try:
+                    task_artifacts_written_tokens += estimate_tokens_from_bytes(p.stat().st_size)
+                except OSError:
+                    pass
+
+    dup_files = []
+    wasted_reads_total = 0
+    wasted_tokens_total = 0
+    for p, cnt in sorted(reads_by_path.items(), key=lambda x: -x[1]):
+        if cnt > 1:
+            wasted_r = cnt - 1
+            file_tok = estimate_tokens_from_bytes(bytes_by_path.get(p, 0))
+            wasted_t = wasted_r * file_tok
+            wasted_reads_total += wasted_r
+            wasted_tokens_total += wasted_t
+            dup_files.append({"path": p, "count": cnt, "wasted_reads": wasted_r, "wasted_tokens": wasted_t})
+
+    trec = load_task(root, task)
+    base_head = trec.get("baseline", {}).get("head") if trec else "HEAD"
+    modified_set = set(changed_files(root, base_head)) if base_head else set()
+
+    unmodified_oos_files = []
+    unmodified_oos_tokens = 0
+    for p in sorted(reads_by_path.keys()):
+        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
+        if not is_framework and not is_planned(p, planned_paths):
+            if p not in modified_set:
+                t = estimate_tokens_from_bytes(bytes_by_path.get(p, 0))
+                unmodified_oos_files.append(p)
+                unmodified_oos_tokens += t
+
+    shell_events = [e for e in ev if e.get("k") == "shell"]
+    denied_shell = sum(1 for e in shell_events if not e.get("ok", True))
+    shell_cmds = [e.get("cmd") or "" for e in shell_events]
+    repeated_shell = max(0, len(shell_cmds) - len(set(shell_cmds)))
+    writes_denied = sum(1 for e in ev if e.get("k") == "write_denied")
+    violations = sum(1 for e in ev if e.get("k") == "violation")
+
+    ccr_events = [e for e in ev if e.get("k") == "ccr"]
+    ccr_raw_tokens = sum(e.get("raw_tokens", 0) for e in ccr_events)
+    ccr_compressed_tokens = sum(e.get("compressed_tokens", 0) for e in ccr_events)
+    ccr_saved_tokens = sum(e.get("saved_tokens", 0) for e in ccr_events)
+    ccr_saved_percent = round((ccr_saved_tokens / ccr_raw_tokens * 100), 1) if ccr_raw_tokens > 0 else 0.0
+
+    return {
+        "task": task,
+        "reads": {
+            "total_reads": len(read_events),
+            "unique_reads": len(reads_by_path),
+            "in_scope_reads": in_scope_reads,
+            "out_of_scope_reads": out_of_scope_reads,
+            "framework_reads": framework_reads,
+        },
+        "tokens": {
+            "in_scope_read_tokens": in_scope_tokens,
+            "out_of_scope_read_tokens": out_of_scope_tokens,
+            "framework_read_tokens": framework_tokens,
+            "total_read_tokens": total_read_tokens,
+            "task_artifacts_written_tokens": task_artifacts_written_tokens,
+            "task_artifacts_count": task_artifacts_count,
+        },
+        "waste": {
+            "duplicate_reads": {
+                "files": dup_files,
+                "count": len(dup_files),
+                "wasted_reads": wasted_reads_total,
+                "wasted_tokens": wasted_tokens_total,
+            },
+            "unmodified_oos_reads": {
+                "files": unmodified_oos_files,
+                "count": len(unmodified_oos_files),
+                "wasted_tokens": unmodified_oos_tokens,
+            },
+            "churn": {
+                "denied_shell": denied_shell,
+                "repeated_shell": repeated_shell,
+                "writes_denied": writes_denied,
+                "violations": violations,
+                "total_churn_events": denied_shell + repeated_shell + writes_denied + violations,
+            },
+            "ccr_savings": {
+                "raw_tokens": ccr_raw_tokens,
+                "compressed_tokens": ccr_compressed_tokens,
+                "saved_tokens": ccr_saved_tokens,
+                "saved_percent": ccr_saved_percent,
+            },
+        },
+    }
+
+
+# --------------------------------------------------------------------------- learning & failure-to-success correlation
+def sanitize_learning_text(text: str) -> str | None:
+    if not text:
+        return None
+    t = INVISIBLE_UNICODE_RE.sub("", text)
+    t = HTML_COMMENT_RE.sub("", t)
+    if ARTIFACT_INJECTION_RE.search(t):
+        return None
+    t = " ".join(t.split()).strip()
+    if not t:
+        return None
+    if not t.startswith("- "):
+        t = f"- {t}"
+    return t
+
+
+def correlate_task_learnings(root: Path, task: str, pol: dict | None = None) -> dict:
+    root = Path(root)
+    trec = load_task(root, task)
+    base_head = trec.get("baseline", {}).get("head") if trec else "HEAD"
+    modified_files = set(changed_files(root, base_head)) if base_head else set()
+
+    wd = root / WORK_REL / task
+    planned_paths = set()
+    if (wd / "WORK.md").exists():
+        try:
+            _, wbody = read_meta(wd / "WORK.md")
+            planned_paths |= section_paths(section(wbody, "Relevant Files"))
+            planned_paths |= section_paths(section(wbody, "Scope"))
+        except Exception:
+            pass
+    if (wd / "PLAN.md").exists():
+        try:
+            _, pbody = read_meta(wd / "PLAN.md")
+            planned_paths |= section_paths(section(pbody, "Files Likely To Change"))
+            planned_paths |= section_paths(section(pbody, "Plan"))
+        except Exception:
+            pass
+
+    # 1. Co-Change / Coupled Files
+    coupled_candidates: list[str] = []
+    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+    for m in sorted(modified_files):
+        if any(m.startswith(pfx) or m == pfx for pfx in framework_prefixes):
+            continue
+        if planned_paths and not is_planned(m, planned_paths):
+            pl_str = ", ".join(f"`{p}`" for p in sorted(planned_paths)[:3])
+            c_text = sanitize_learning_text(f"When modifying {pl_str}, also inspect `{m}` (co-modified in {task}).")
+            if c_text and c_text not in coupled_candidates:
+                coupled_candidates.append(c_text)
+
+    # 2. Guardrail, shell denial recovery & verification transitions
+    convention_candidates: list[str] = []
+    audit_file = state_dir(root) / "audit" / f"{task}.jsonl"
+    ev = []
+    if audit_file.exists():
+        for line in audit_file.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    ev.append(json.loads(line))
+                except ValueError:
+                    pass
+
+    denied_shells = [e for e in ev if e.get("k") == "shell" and not e.get("ok", True)]
+    successful_shells = [e for e in ev if e.get("k") == "shell" and e.get("ok", True)]
+    if denied_shells and successful_shells:
+        for ds in denied_shells:
+            cmd = ds.get("cmd", "").strip()
+            if cmd:
+                c_text = sanitize_learning_text(f"Avoid command `{cmd}` (denied by policy guardrails during {task}).")
+                if c_text and c_text not in convention_candidates:
+                    convention_candidates.append(c_text)
+
+    denied_writes = [e for e in ev if e.get("k") == "write_denied"]
+    for dw in denied_writes:
+        p = dw.get("p", "").strip()
+        why = dw.get("why", "").strip()
+        if p:
+            c_text = sanitize_learning_text(f"Do not modify `{p}` directly ({why or 'write restricted by policy'}).")
+            if c_text and c_text not in convention_candidates:
+                convention_candidates.append(c_text)
+
+    ccr_events = [e for e in ev if e.get("k") == "ccr"]
+    failed_checks = {e.get("check") for e in ccr_events if e.get("exit") != 0}
+    passed_checks = {e.get("check") for e in ccr_events if e.get("exit") == 0}
+    fixed_checks = failed_checks & passed_checks
+    for fc in sorted(fixed_checks):
+        if fc:
+            c_text = sanitize_learning_text(f"Verification check `{fc}` must be verified before handoff (failed and resolved in {task}).")
+            if c_text and c_text not in convention_candidates:
+                convention_candidates.append(c_text)
+
+    # 3. Gate rejection & unblock feedback
+    recs = load_records(root, task)
+    for r in recs:
+        if r.get("decision") == "reject" or r.get("gate") == "block":
+            note = str(r.get("note", "")).strip()
+            if note:
+                c_text = sanitize_learning_text(f"Gate {r.get('gate', 'review')} requirement: {note}")
+                if c_text and c_text not in convention_candidates:
+                    convention_candidates.append(c_text)
+
+    return {
+        "task": task,
+        "conventions": convention_candidates,
+        "couplings": coupled_candidates,
+    }
+
+
+def apply_learnings_to_overlay(root: Path, pol: dict, task: str, learnings: dict) -> dict:
+    root = Path(root)
+    overlay_dir = root / OVERLAY_REL
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+
+    added_conventions = []
+    added_couplings = []
+
+    # 1. Conventions (max 80 lines)
+    conv_path = overlay_dir / "conventions.md"
+    existing_conv_lines = conv_path.read_text(encoding="utf-8").splitlines() if conv_path.exists() else [
+        "# Repository Architectural Conventions & Skill Guidance",
+        "",
+        "## Learned Conventions",
+    ]
+    if not any(re.match(r"^##\s+Learned Conventions", l) for l in existing_conv_lines):
+        existing_conv_lines += ["", "## Learned Conventions"]
+
+    existing_conv_set = set(existing_conv_lines)
+    for c in learnings.get("conventions", []):
+        if c not in existing_conv_set:
+            existing_conv_lines.append(c)
+            existing_conv_set.add(c)
+            added_conventions.append(c)
+
+    if len(existing_conv_lines) > 80:
+        excess = len(existing_conv_lines) - 80
+        l_idx = -1
+        for idx, line in enumerate(existing_conv_lines):
+            if re.match(r"^##\s+Learned Conventions", line):
+                l_idx = idx
+                break
+        if l_idx != -1 and l_idx + 1 < len(existing_conv_lines):
+            trim_start = l_idx + 1
+            trim_end = min(len(existing_conv_lines), trim_start + excess)
+            existing_conv_lines = existing_conv_lines[:trim_start] + existing_conv_lines[trim_end:]
+
+    conv_path.write_text("\n".join(existing_conv_lines) + "\n", encoding="utf-8")
+
+    # 2. Repository Map (max 120 lines)
+    map_path = overlay_dir / "repository-map.md"
+    existing_map_lines = map_path.read_text(encoding="utf-8").splitlines() if map_path.exists() else [
+        "# Repository Map & File Couplings",
+        "",
+        "## Learned File Couplings",
+    ]
+    if not any(re.match(r"^##\s+Learned File Couplings", l) for l in existing_map_lines):
+        existing_map_lines += ["", "## Learned File Couplings"]
+
+    existing_map_set = set(existing_map_lines)
+    for c in learnings.get("couplings", []):
+        if c not in existing_map_set:
+            existing_map_lines.append(c)
+            existing_map_set.add(c)
+            added_couplings.append(c)
+
+    if len(existing_map_lines) > 120:
+        excess = len(existing_map_lines) - 120
+        l_idx = -1
+        for idx, line in enumerate(existing_map_lines):
+            if re.match(r"^##\s+Learned File Couplings", line):
+                l_idx = idx
+                break
+        if l_idx != -1 and l_idx + 1 < len(existing_map_lines):
+            trim_start = l_idx + 1
+            trim_end = min(len(existing_map_lines), trim_start + excess)
+            existing_map_lines = existing_map_lines[:trim_start] + existing_map_lines[trim_end:]
+
+    map_path.write_text("\n".join(existing_map_lines) + "\n", encoding="utf-8")
+
+    ensure_key()
+    integrity_refresh(root, pol)
+
+    return {
+        "conventions_added": added_conventions,
+        "couplings_added": added_couplings,
+        "status": "updated",
+    }
+
+
+# --------------------------------------------------------------------------- diff digest
+def generate_diff_digest(root: Path, task: str, base_head: str, wd: Path, pol: dict | None = None) -> Path:
+    root = Path(root)
+    wd = Path(wd)
+    wd.mkdir(parents=True, exist_ok=True)
+    digest_path = wd / "DIFF-DIGEST.md"
+
+    pol = pol if pol is not None else load_policy(root)
+    d_sha = diff_sha(root, base_head)
+    gen_time = now()
+
+    # Planned files from WORK.md and PLAN.md
+    planned_paths = set()
+    if (wd / "WORK.md").exists():
+        try:
+            _, wbody = read_meta(wd / "WORK.md")
+            planned_paths |= section_paths(section(wbody, "Relevant Files"))
+            planned_paths |= section_paths(section(wbody, "Scope"))
+        except Exception:
+            pass
+    if (wd / "PLAN.md").exists():
+        try:
+            _, pbody = read_meta(wd / "PLAN.md")
+            planned_paths |= section_paths(section(pbody, "Files Likely To Change"))
+            planned_paths |= section_paths(section(pbody, "Plan"))
+        except Exception:
+            pass
+
+    # Modified files
+    modified_files = set(changed_files(root, base_head))
+    # Untracked files
+    untracked_out = git_out(root, ["ls-files", "--others", "--exclude-standard"])
+    untracked_files = [f for f in untracked_out.splitlines() if f and not f.startswith((".helm/", f"{WORK_REL}/"))]
+
+    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+    repo_modified = sorted(f for f in modified_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes))
+
+    planned_and_modified = [f for f in repo_modified if is_planned(f, planned_paths)]
+    planned_and_untouched = sorted(p for p in planned_paths if not any(f == p or f.startswith(p + "/") for f in repo_modified))
+    unplanned_modified = [f for f in repo_modified if not is_planned(f, planned_paths)]
+
+    # Numstat
+    numstat_rc, numstat_out = git_run(root, ["diff", "--numstat", base_head, "--"])
+    numstat_lines = numstat_out.decode("utf-8", "replace").splitlines()
+
+    lockfile_patterns = (
+        "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "Cargo.lock", "poetry.lock",
+        "Gemfile.lock", "composer.lock", ".min.js", ".min.css"
+    )
+
+    def classify_file(p: str) -> str:
+        if any(p.endswith(lp) or lp in p for lp in lockfile_patterns):
+            return "Lockfiles/Generated"
+        p_lower = p.lower()
+        if "test" in p_lower or "spec" in p_lower or any_match(pol.get("test_globs", []), p):
+            return "Tests"
+        if p.endswith((".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".txt", ".rst")) or p.startswith("docs/"):
+            return "Config/Docs"
+        return "Source"
+
+    numstat_rows = []
+    for line in numstat_lines:
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            added, deleted, p = parts[0], parts[1], parts[2]
+            cat = classify_file(p)
+            numstat_rows.append(f"| `{p}` | +{added} | -{deleted} | {cat} |")
+
+    for u in untracked_files:
+        cat = classify_file(u)
+        numstat_rows.append(f"| `{u}` | (new) | - | {cat} |")
+
+    # Static review signals: added signatures and risk markers
+    _, raw_diff_b = git_run(root, ["diff", "-U3", base_head, "--"])
+    raw_diff = raw_diff_b.decode("utf-8", "replace")
+
+    sig_re = re.compile(r"^\+\s*(?:export\s+)?(?:def\s+[A-Za-z0-9_]+|class\s+[A-Za-z0-9_]+|function\s+[A-Za-z0-9_]+|const\s+[A-Za-z0-9_]+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>)", re.M)
+    risk_re = re.compile(r"\b(TODO|FIXME|@ts-ignore|eslint-disable|eval\(|subprocess|SELECT \*|exec\(|unsafe)\b")
+
+    found_sigs = []
+    found_risks = []
+    for line in raw_diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            content = line[1:]
+            for sig in sig_re.findall(line):
+                cleaned_sig = sig.lstrip("+").strip()
+                if cleaned_sig and cleaned_sig not in found_sigs:
+                    found_sigs.append(cleaned_sig)
+            m = risk_re.search(content)
+            if m:
+                found_risks.append(f"`{m.group(0)}` in: `{content.strip()[:80]}`")
+
+    # Unified Diff Hunks (folding lockfiles into CCR pointers)
+    diff_hunk_lines = []
+    current_file = None
+    file_lines = []
+
+    def flush_file_hunks():
+        nonlocal current_file, file_lines, diff_hunk_lines
+        if not current_file:
+            return
+        if any(current_file.endswith(lp) or lp in current_file for lp in lockfile_patterns):
+            diff_hunk_lines.append(
+                f"[... CCR: lockfile/generated diff omitted ({len(file_lines)} lines, folded: lockfile) -> git diff {base_head} -- {current_file} ...]"
+            )
+        else:
+            diff_hunk_lines.extend(file_lines)
+        file_lines = []
+
+    for line in raw_diff.splitlines():
+        if line.startswith("diff --git "):
+            flush_file_hunks()
+            m = re.search(r" b/(.+)$", line)
+            current_file = m.group(1) if m else None
+            file_lines = [line]
+        else:
+            file_lines.append(line)
+    flush_file_hunks()
+
+    for u in untracked_files:
+        if any(u.endswith(lp) or lp in u for lp in lockfile_patterns):
+            diff_hunk_lines.append(
+                f"[... CCR: lockfile/generated file omitted (untracked, folded: lockfile) -> {u} ...]"
+            )
+        else:
+            try:
+                p_obj = root / u
+                if p_obj.is_file():
+                    u_lines = p_obj.read_text(encoding="utf-8", errors="replace").splitlines()
+                    diff_hunk_lines.append(f"diff --git a/{u} b/{u}\nnew file mode 100644\n--- /dev/null\n+++ b/{u}\n@@ -0,0 +1,{len(u_lines)} @@")
+                    diff_hunk_lines.extend("+" + ul for ul in u_lines[:50])
+                    if len(u_lines) > 50:
+                        diff_hunk_lines.append(f"[... omitted {len(u_lines) - 50} lines of new file ...]")
+            except Exception:
+                pass
+
+    max_diff_lines = 1000
+    if len(diff_hunk_lines) > max_diff_lines:
+        omitted = len(diff_hunk_lines) - max_diff_lines
+        diff_hunk_lines = diff_hunk_lines[:max_diff_lines]
+        diff_hunk_lines.append(f"\n[... CCR: omitted {omitted} diff lines -> run git diff {base_head} ...]")
+
+    rendered_diff = "\n".join(diff_hunk_lines)
+
+    content = [
+        "---",
+        "status: ready",
+        f"task: {task}",
+        f"base_head: {base_head}",
+        f"diff_sha: {d_sha}",
+        f"files_changed: {len(repo_modified)}",
+        f"unplanned_files: {len(unplanned_modified)}",
+        f"generated: {gen_time}",
+        "---",
+        f"# Reviewer Diff Digest: {task}",
+        "",
+        "## Summary",
+        f"- **Files Changed**: {len(repo_modified)}",
+        f"- **Unplanned Changes**: {len(unplanned_modified)}",
+        "",
+        "## Scope Analysis",
+        f"- **Planned & Modified** ({len(planned_and_modified)}): " + (", ".join(f"`{f}`" for f in planned_and_modified) if planned_and_modified else "None"),
+        f"- **Planned & Untouched** ({len(planned_and_untouched)}): " + (", ".join(f"`{f}`" for f in planned_and_untouched) if planned_and_untouched else "None"),
+        f"- **Unplanned Modified (Scope Creep Warning)** ({len(unplanned_modified)}): " + (", ".join(f"`{f}` [⚠️ UNPLANNED (scope creep)]" for f in unplanned_modified) if unplanned_modified else "None (Clean Scope)"),
+        f"- **Untracked Files** ({len(untracked_files)}): " + (", ".join(f"`{f}`" for f in untracked_files) if untracked_files else "None"),
+        "",
+        "## Classification",
+        "| File | Added | Deleted | Classification |",
+        "|---|---|---|---|",
+    ]
+    if numstat_rows:
+        content.extend(numstat_rows)
+    else:
+        content.append("| None | 0 | 0 | - |")
+
+    content.extend([
+        "",
+        "## Static Review Signals",
+        "### Modified Signatures",
+    ])
+    if found_sigs:
+        content.extend([f"- `{s}`" for s in found_sigs[:25]])
+    else:
+        content.append("- None detected")
+
+    content.extend([
+        "",
+        "### Risk Markers Found in Diff",
+    ])
+    if found_risks:
+        content.extend([f"- {r}" for r in found_risks[:25]])
+    else:
+        content.append("- None (Clean)")
+
+    content.extend([
+        "",
+        "## Per-File Summary & Unified Diff Hunks",
+        "```diff",
+        rendered_diff if rendered_diff.strip() else "(no diff)",
+        "```",
+        "",
+    ])
+
+    digest_text = "\n".join(content)
+    digest_path.write_text(digest_text, encoding="utf-8")
+    return digest_path

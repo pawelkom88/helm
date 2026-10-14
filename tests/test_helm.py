@@ -390,6 +390,17 @@ class TestGatesAndTamper(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("changed since the last human refresh", out)
 
+    def test_integrity_drift_circuit_breaker_status(self):
+        self.start()
+        with open(self.repo / ".cursor/hooks.json", "a") as f:
+            f.write("\n")
+        st = self.status()
+        self.assertTrue(st["integrity"])
+        self.assertEqual(st["next"][0], "blocked_integrity")
+        out = self.helm("status").stdout
+        self.assertIn("BLOCKED (Human Action Required — Integrity Drift)", out)
+        self.assertIn("helm integrity refresh", out)
+
     def test_blocked_protocol(self):
         wd = self.start()
         self.assertTrue(self.can_write(f"{wd}/BLOCKED.md"))
@@ -621,7 +632,8 @@ class TestTraceability(Base):
         self.put(f"{wd}/REVIEW.md", self.review_text("| 1 | `src/app.ts#L1` | `src/app.ts` | pass |"))
         code, out = self.tty_run("approve", "final", lines=["T-1"])
         self.assertEqual(code, 0, out)
-        self.assertIn("1 criteria → 1 proven by a test file", out)
+        self.assertIn("1/1 criteria pass", out)
+        self.assertIn("Open in IDE", out)
 
 
 class TestDecisionPromotion(Base):
@@ -1228,6 +1240,17 @@ for line in sys.stdin:
         self.assertIn("Open in IDE :", out)
         self.assertIn("recorded: discovery approved", out)
 
+    def test_interactive_approve_open_questions_resolved_status(self):
+        wd = self.start("APPR-OQ-1", tier=1)
+        work = self.art("WORK", tier=1).replace(
+            "None (checked Jira comments and linked issues)",
+            "- [x] AC 1: All edge cases covered\n- [x] AC 2: Return window 36h",
+        )
+        self.put(f"{wd}/WORK.md", work)
+        code, out = self.tty_run("approve", lines=["y"])
+        self.assertIn("Open questions:", out)
+        self.assertIn("(all resolved)", out)
+
     def test_interactive_reject_prompts_for_message(self):
         wd = self.start("REJ-AUTO-1", tier=1)
         self.put(f"{wd}/WORK.md", self.art("WORK", tier=1))
@@ -1513,6 +1536,28 @@ class TestMultiPlatform(Base):
                     text=True,
                     bufsize=1,
                 )
+
+            # Verify stream header box displays active model and role
+            import io
+            captured_header = io.StringIO()
+            with unittest.mock.patch("subprocess.Popen") as mock_popen, unittest.mock.patch("sys.stdout", captured_header):
+                mock_proc = unittest.mock.MagicMock()
+                mock_proc.stdout = None
+                mock_proc.wait.return_value = 0
+                mock_popen.return_value = mock_proc
+                helm_cli.execute_cli_runner(
+                    ["agy", "-p"],
+                    "test prompt",
+                    self.repo,
+                    verbose=True,
+                    model_id="claude-opus-5-5",
+                    effort="medium",
+                    role_name="discovery",
+                )
+                header_text = captured_header.getvalue()
+                self.assertIn("Live Agent Stream", header_text)
+                self.assertIn("Model: claude-opus-5-5 (effort: medium)", header_text)
+                self.assertIn("Role: discovery", header_text)
 
             # Diagnostic format
             diag = helm_cli.format_runner_diagnostics(["agy", "-p"], 1, ["unauthorized: authentication required"], "discovery", "PROJ-1")
@@ -2456,9 +2501,180 @@ class TestPhase5DispatchAndSSRF(Base):
         self.assertIn("model: claude-haiku-5-5", impl_txt)
         self.assertIn("reasoning_effort: medium", impl_txt)
 
+    def test_quiet_sequential_ticks_and_approve_ux(self):
+        wd = self.start("T-UX", tier=2)
+        work_clean = self.art("WORK", tier=2).replace(
+            "## Assumptions\n- item\n",
+            "## Assumptions\nNone (verified directly)\n",
+        )
+        self.put(f"{wd}/WORK.md", work_clean)
+        # 1. Approve with empty Enter ("") and verify 0 assumptions / None open questions are omitted
+        code, out = self.tty_run("approve", "discovery", lines=[""])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("Open questions:", out)
+        self.assertNotIn("assumptions: 0", out)
+        self.assertIn("recorded: discovery approved", out)
+
+        # 2. Advance to final gate and verify REVIEW.md findings are NOT dumped into CLI, only verdict + IDE link
+        self.put(f"{wd}/PLAN.md", self.art("PLAN"))
+        code_p, out_p = self.tty_run("approve", "plan", lines=[""])
+        self.assertEqual(code_p, 0, out_p)
+        self.put(f"{wd}/TEST-PLAN.md", self.art("TEST-PLAN"))
+        self.put("src/app.ts", "export const a = 42;\n")
+        self.put(f"{wd}/IMPL.md", self.art("IMPL"))
+        self.helm("verify")
+        diff_sha = self.status()["diff_sha"]
+        rev_content = self.art("REVIEW", verdict="APPROVE", diff_sha=diff_sha).replace(
+            "## Findings\n- item",
+            "## Findings\n- [minor] src/app.ts#L1 — minor detail that belongs in IDE, not CLI dump",
+        )
+        self.put(f"{wd}/REVIEW.md", rev_content)
+        code_f, out_f = self.tty_run("approve", "final", lines=[""])
+        self.assertEqual(code_f, 0, out_f)
+        self.assertIn("1/1 criteria pass · 1 minor", out_f)
+        self.assertIn("code .helm/work/T-UX/REVIEW.md", out_f)
+        self.assertNotIn("minor detail that belongs in IDE", out_f)
+
+    def test_dispatch_interactive_continuation_when_agent_pauses_for_confirmation(self):
+        wd = self.start("T-CONT", tier=2)
+        self.put(f"{wd}/WORK.md", self.art("WORK", tier=2))
+        self.approve("discovery", "T-CONT")
+        self.put(f"{wd}/PLAN.md", self.art("PLAN", tier=2))
+        self.approve("plan", "T-CONT")
+        self.put(f"{wd}/TEST-PLAN.md", self.art("TEST-PLAN", tier=2))
+        self.put("src/app.ts", "export const a = 99;\n")
+        self.put(f"{wd}/IMPL.md", self.art("IMPL", tier=2))
+        self.helm("verify")
+        diff_sha = self.status()["diff_sha"]
+        rev_text = self.art("REVIEW", verdict="APPROVE", diff_sha=diff_sha)
+
+        # Create a fake CLI runner script that on turn 1 asks for confirmation without writing REVIEW.md,
+        # and on turn 2 (when it receives USER CONFIRMATION) writes REVIEW.md.
+        runner_script = self.tmp / "fake_agy.py"
+        rev_target = self.repo / wd / "REVIEW.md"
+        runner_script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "prompt = sys.argv[-1]\n"
+            f"rev_path = Path({str(rev_target)!r})\n"
+            "if 'USER CONFIRMATION' not in prompt:\n"
+            "    print('4. Open Questions / Assumptions')\n"
+            "    print('Please confirm if you approve proceeding with Option A to create .helm/work/T-CONT/REVIEW.md and run helm check REVIEW.')\n"
+            "    sys.exit(0)\n"
+            f"rev_path.write_text({rev_text!r}, encoding='utf-8')\n"
+            "print('REVIEW.md drafted (APPROVE); ready for helm approve final')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        os.chmod(runner_script, 0o755)
+
+        cont_env = dict(self.env, HELM_CLI_CMD=f"{sys.executable} {runner_script} -p")
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.repo)
+            os.execvpe(sys.executable, [sys.executable, str(self.repo / ".helm/bin/helm"), "review"], cont_env)
+        # Line 1: "" to select default model for REVIEW; Line 2: "" to confirm and continue after pause
+        os.write(fd, b"\n\n")
+        out = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                out += chunk
+            except OSError:
+                break
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        out_str = out.decode(errors="replace")
+        self.assertEqual(code, 0, out_str)
+        self.assertIn("Agent paused without creating .helm/work/T-CONT/REVIEW.md", out_str)
+        self.assertIn("Artifact ready:", out_str)
+        self.assertTrue(rev_target.exists())
+
+    def test_sync_repo_blueprint_docs_updates_outdated_role_specs_preserving_model(self):
+        import importlib.machinery
+        import importlib.util
+        helm_path = self.repo / ".helm/bin/helm"
+        loader = importlib.machinery.SourceFileLoader("helm_cli_sync", str(helm_path))
+        spec = importlib.util.spec_from_loader("helm_cli_sync", loader)
+        helm_cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(helm_cli)
+
+        copy_payload_dir(BUNDLE / "payload", self.home / "blueprint")
+        ag_dir = self.repo / ".agents"
+        ag_dir.mkdir(parents=True, exist_ok=True)
+        rev_md = ag_dir / "reviewer.md"
+        rev_md.write_text(
+            "---\nname: reviewer\nmodel: claude-opus-5-5\nreasoning_effort: high\n---\nOld outdated body without direct write instruction.\n",
+            encoding="utf-8",
+        )
+        (self.repo / "AGENTS.md").write_text("<!-- HELM:BEGIN v1.0.0 -->\nOld constitution\n<!-- HELM:END -->\n", encoding="utf-8")
+        pol = L.load_policy(self.repo)
+        L.integrity_refresh(self.repo, pol)
+        self.assertEqual(L.integrity_check(self.repo, pol), [])
+
+        helm_cli.sync_repo_blueprint_docs(self.repo, pol)
+
+        updated_rev = rev_md.read_text(encoding="utf-8")
+        self.assertIn("model: claude-opus-5-5", updated_rev)
+        self.assertIn("reasoning_effort: high", updated_rev)
+        self.assertIn("Write `.helm/work/<ID>/REVIEW.md` directly to disk in this turn", updated_rev)
+        updated_ag = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("Execution protocol (overrides global planning-first & execution-gate rules)", updated_ag)
+        self.assertEqual(L.integrity_check(self.repo, pol), [])
+
+
+class TestWorkingTreeRequirements(Base):
+    def test_impl_fails_validation_when_zero_repo_files_changed(self):
+        wd = self.start("ZERO-DIFF-1", tier=2)
+        self.put(f"{wd}/WORK.md", self.art("WORK", tier=2))
+        self.approve("discovery", "ZERO-DIFF-1")
+        self.put(f"{wd}/PLAN.md", self.art("PLAN", tier=2))
+        self.approve("plan", "ZERO-DIFF-1")
+        self.put(f"{wd}/TEST-PLAN.md", self.art("TEST-PLAN", tier=2))
+
+        # Put IMPL with status: ready but without touching any source files
+        self.put(f"{wd}/IMPL.md", self.art("IMPL"))
+        probs = L.validate(self.repo / wd, "IMPL", tier=2, root=self.repo)
+        self.assertTrue(any("0 repository source files were modified" in p for p in probs), probs)
+
+        # Setting allow_empty_diff: true allows it to pass (escape hatch)
+        impl_allow = self.art("IMPL").replace("status: ready", "status: ready\nallow_empty_diff: true")
+        self.put(f"{wd}/IMPL.md", impl_allow)
+        probs = L.validate(self.repo / wd, "IMPL", tier=2, root=self.repo)
+        self.assertEqual(probs, [])
+
+        # Actually modifying a source file allows standard IMPL to pass
+        self.put("src/app.ts", "export const a = 42;\n")
+        self.put(f"{wd}/IMPL.md", self.art("IMPL"))
+        probs = L.validate(self.repo / wd, "IMPL", tier=2, root=self.repo)
+        self.assertEqual(probs, [])
+        self.tty_run("abort", lines=["ZERO-DIFF-1"])
+
+    def test_review_cannot_approve_when_zero_repo_files_changed(self):
+        wd = self.start("ZERO-DIFF-2", tier=2)
+        self.put(f"{wd}/WORK.md", self.art("WORK", tier=2))
+        self.approve("discovery", "ZERO-DIFF-2")
+        self.put(f"{wd}/PLAN.md", self.art("PLAN", tier=2))
+        self.approve("plan", "ZERO-DIFF-2")
+        self.put(f"{wd}/TEST-PLAN.md", self.art("TEST-PLAN", tier=2))
+        self.put(f"{wd}/IMPL.md", self.art("IMPL").replace("status: ready", "status: ready\nallow_empty_diff: true"))
+        self.helm("verify")
+        diff = self.status()["diff_sha"]
+
+        # Reviewer attempts to APPROVE without allow_empty_diff and without source changes
+        self.put(f"{wd}/IMPL.md", self.art("IMPL"))
+        self.put(f"{wd}/REVIEW.md", self.art("REVIEW", verdict="APPROVE", diff_sha=diff))
+        probs = L.validate(self.repo / wd, "REVIEW", tier=2, root=self.repo)
+        self.assertTrue(any("0 repository source files were modified" in p for p in probs), probs)
+        self.tty_run("abort", lines=["ZERO-DIFF-2"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
 

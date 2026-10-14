@@ -79,19 +79,26 @@ def find_blueprint():
         Path(__file__).resolve().parent.parent,
     ]
     for c in cands:
-        if (c / ".helm/policy/policy.json").exists() or (c / "policy/policy.json").exists():
-            return c
+        for check in (c / ".helm/policy/policy.json", c / "policy/policy.json"):
+            try:
+                check.read_bytes()
+                return c
+            except OSError:
+                pass
     return None
 
 
 def read_blueprint_bytes(p: Path) -> bytes:
     try:
         return p.read_bytes()
-    except OSError:
+    except OSError as e:
         bundle_root = Path(__file__).resolve().parent.parent.parent.parent
-        rel = p.relative_to(bundle_root).as_posix()
-        res = subprocess.run(["git", "show", f":{rel}"], cwd=bundle_root, capture_output=True, check=True)
-        return res.stdout
+        try:
+            rel = p.relative_to(bundle_root).as_posix()
+            res = subprocess.run(["git", "show", f":{rel}"], cwd=bundle_root, capture_output=True, check=True)
+            return res.stdout
+        except Exception:
+            raise e
 
 
 def read_blueprint_text(p: Path) -> str:
@@ -306,11 +313,116 @@ def ensure_antigravity_env(root: Path):
         agent_files = list(src_agents.glob("*.md")) or [p for p in list_blueprint_files(src_agents) if p.suffix == ".md"]
         for af in agent_files:
             df = ag_dir / af.name
-            if not df.exists():
-                try:
-                    copy_blueprint_file(af, df)
-                except Exception:
-                    pass
+            try:
+                sync_agent_role_file(af, df)
+            except Exception:
+                pass
+
+
+def sync_agent_role_file(src: Path, dst: Path) -> bool:
+    """Sync role markdown file from blueprint while preserving existing model/reasoning_effort frontmatter."""
+    try:
+        if src.resolve() == dst.resolve():
+            return False
+    except OSError:
+        pass
+    try:
+        src_txt = read_blueprint_text(src)
+    except Exception:
+        return False
+    if not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(src_txt, encoding="utf-8")
+        return True
+    try:
+        dst_txt = dst.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    src_parts = src_txt.split("---", 2)
+    dst_parts = dst_txt.split("---", 2)
+    if len(src_parts) >= 3 and len(dst_parts) >= 3:
+        if src_parts[2].strip() == dst_parts[2].strip():
+            return False
+        new_txt = f"---{dst_parts[1]}---{src_parts[2]}"
+        dst.write_text(new_txt, encoding="utf-8")
+        return True
+    if src_txt != dst_txt:
+        dst.write_text(src_txt, encoding="utf-8")
+        return True
+    return False
+
+
+def sync_repo_blueprint_docs(root: Path, pol: dict | None = None):
+    """Auto-sync AGENTS.md block, bin scripts, and active platform role specs from blueprint if integrity was clean."""
+    bp = find_blueprint()
+    if not bp:
+        return
+    if (bp / ".helm").exists():
+        payload_dir = bp
+    elif (bp / "payload/.helm").exists():
+        payload_dir = bp / "payload"
+    elif (bp.parent / ".helm").exists():
+        payload_dir = bp.parent
+    else:
+        payload_dir = bp
+
+    try:
+        p = pol if pol is not None else L.load_policy(root)
+        was_clean = (L.integrity_check(root, p) == [])
+    except Exception:
+        return
+
+    cfg = L.load_json(root / ".helm/config.json", {})
+    platforms = cfg.get("platforms", [])
+    if "antigravity" in platforms or (root / ".agents").exists():
+        ensure_antigravity_env(root)
+
+    if not was_clean:
+        return
+
+    changed = bool(L.integrity_check(root, p))
+    agents_src = payload_dir / "AGENTS.helm.md"
+    if not agents_src.exists():
+        agents_src = bp / "AGENTS.helm.md"
+    agents_dst = root / "AGENTS.md"
+    if agents_src.exists() and agents_dst.exists():
+        try:
+            old_ag = agents_dst.read_text(encoding="utf-8")
+            insert_block(agents_dst, read_blueprint_text(agents_src))
+            if agents_dst.read_text(encoding="utf-8") != old_ag:
+                changed = True
+        except Exception:
+            pass
+
+    for rel_dir in (".agents", ".cursor/agents", ".claude/agents", ".codex/agents"):
+        dst_dir = root / rel_dir
+        src_dir = payload_dir / rel_dir
+        if dst_dir.exists() and src_dir.exists():
+            src_files = list(src_dir.glob("*.md")) or [x for x in list_blueprint_files(src_dir) if x.suffix == ".md"]
+            for sf in src_files:
+                if sync_agent_role_file(sf, dst_dir / sf.name):
+                    changed = True
+
+    for bin_name in ("helm", "helm_guard.py", "helm_lib.py"):
+        src_bin = payload_dir / ".helm/bin" / bin_name
+        dst_bin = root / ".helm/bin" / bin_name
+        if src_bin.exists() and dst_bin.exists():
+            try:
+                if src_bin.resolve() != dst_bin.resolve():
+                    src_b = read_blueprint_bytes(src_bin)
+                    if dst_bin.read_bytes() != src_b:
+                        dst_bin.write_bytes(src_b)
+                        os.chmod(dst_bin, 0o755)
+                        changed = True
+            except Exception:
+                pass
+
+    if changed:
+        try:
+            L.ensure_key()
+            L.integrity_refresh(root, p)
+        except Exception:
+            pass
 
 
 def merge_claude_settings(dst: Path, src: Path):
@@ -1174,6 +1286,12 @@ def build_status(root, pol):
             d = L.latest(decs, g, inp) if inp and (g != "final" or info.get("diff_sha")) else None
             gates[g] = d["decision"] if d else "pending"
         st["gates"] = gates
+
+        # Circuit Breaker: If protected files have drifted or git baseline changed, override st["next"]
+        if st["integrity"]:
+            st["next"] = ("blocked_integrity", "Resolve integrity drift before proceeding: run `helm integrity refresh` or revert changes.")
+        elif st.get("git_changed"):
+            st["next"] = ("blocked_git", "Resolve Git state drift before proceeding: run `helm baseline refresh` or revert changes.")
     return st
 
 
@@ -1205,7 +1323,10 @@ def print_status(st, brief=False):
         "FINISHED": "green", "ABORTED": "dim", "IDLE": "dim"
     }
     p_color = phase_colors.get(st["phase"], "bold")
-    print(f"│  Phase          : " + ctext(st["phase"], p_color))
+    phase_display = ctext(st["phase"], p_color)
+    if st.get("integrity") or st.get("git_changed"):
+        phase_display += " " + ctext("[BLOCKED]", "bold_red")
+    print(f"│  Phase          : {phase_display}")
 
     # Gates
     if st.get("gates"):
@@ -1252,7 +1373,29 @@ def print_status(st, brief=False):
             print("│     " + ctext(f"• To approve : helm approve {gate}", "green"))
             print("│     " + ctext(f"• To reject  : helm reject {gate} -m \"your feedback\"", "bold_orange"))
         else:
-            print("│     " + ctext(text, "green"))
+            if st.get("phase") == "READY_FOR_DEVELOPER" and not bool(L.git_out(root, ["status", "--porcelain"])):
+                print("│     " + ctext("Working tree is clean. Complete task via: helm finish", "bold_orange"))
+            else:
+                print("│     " + ctext(text, "green"))
+    elif who == "blocked_integrity":
+        print(ctext("│  ⛔ BLOCKED (Human Action Required — Integrity Drift):", "bold_red"))
+        drift = st.get("integrity", [])
+        clean_drift = [d.replace("changed: ", "").replace("added: ", "").replace("removed: ", "") for d in drift]
+        target = clean_drift[0] if clean_drift else "framework file"
+        more = f" (+{len(clean_drift) - 1} more)" if len(clean_drift) > 1 else ""
+        if clean_drift and clean_drift[0].startswith("<"):
+            print("│     " + ctext("No valid integrity manifest found.", "red"))
+            print("│     " + ctext("• To initialize/refresh manifest: run `helm integrity refresh`", "green"))
+        else:
+            print("│     " + ctext(f"Protected framework file(s) modified: {target}{more}", "red"))
+            print("│     " + ctext("• To accept your changes : run `helm integrity refresh`", "green"))
+            print("│     " + ctext(f"• To revert modifications: run `git checkout -- {target}`", "bold_orange"))
+    elif who == "blocked_git":
+        print(ctext("│  ⛔ BLOCKED (Human Action Required — Git State Drift):", "bold_red"))
+        gv_str = ", ".join(st.get("git_changed", [])[:2])
+        print("│     " + ctext(f"Git state changed outside governance: {gv_str}", "red"))
+        print("│     " + ctext("• If change was intentional: run `helm baseline refresh`", "green"))
+        print("│     " + ctext("• Otherwise revert git modifications to match the task baseline", "bold_orange"))
     else:
         print(f"│  Status         : {text}")
 
@@ -1928,6 +2071,29 @@ def cmd_status(a):
         print_status(st, brief=a.brief)
 
 
+def _live_steps_path(root: Path) -> Path:
+    return L.state_dir(root) / "live_steps.jsonl"
+
+
+def _clear_live_steps(root: Path) -> None:
+    try:
+        p = _live_steps_path(root)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _emit_live_step(root: Path, payload: dict) -> None:
+    try:
+        p = _live_steps_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+
+
 def cmd_check(a):
     root, pol = ctx()
     active = need_task(root)
@@ -1946,6 +2112,13 @@ def cmd_check(a):
         if a.artifact == "all" and not (wd / L.SPECS[n]["file"]).exists():
             continue
         probs = L.validate(wd, n, info["tier"], root)
+        _emit_live_step(root, {
+            "event": "done",
+            "kind": "check",
+            "name": n,
+            "ok": not probs,
+            "count": len(probs),
+        })
         print(f"{n}: " + ("OK" if not probs else "PROBLEMS"))
         for p in probs:
             print(f"  - {p}")
@@ -2028,6 +2201,12 @@ def run_checks(root, only=None, wd=None):
     for c in checks:
         if only and c["name"] not in only:
             continue
+        _emit_live_step(root, {
+            "event": "start",
+            "kind": "verify",
+            "name": c["name"],
+            "cmd": c["cmd"],
+        })
         t0 = time.time()
         try:
             r = subprocess.run(shlex.split(c["cmd"]), cwd=root, capture_output=True, text=True, timeout=int(c.get("timeout_s", 900)))
@@ -2065,12 +2244,30 @@ def run_checks(root, only=None, wd=None):
                 raw_tokens = L.estimate_tokens_from_bytes(len((out or "").encode("utf-8", "replace")))
                 compressed_tokens = 0
                 saved_tokens = raw_tokens
+        elapsed_s = round(time.time() - t0, 1)
+        rel_log = ""
+        if wd is not None and log:
+            try:
+                rel_log = (wd / log).relative_to(root).as_posix()
+            except Exception:
+                rel_log = log
+        _emit_live_step(root, {
+            "event": "done",
+            "kind": "verify",
+            "name": c["name"],
+            "cmd": c["cmd"],
+            "ok": code == 0,
+            "seconds": elapsed_s,
+            "log": rel_log,
+            "partial": bool(only),
+        })
         results.append({"name": c["name"], "cmd": c["cmd"], "required": bool(c.get("required", True)), "exit": code,
-                        "seconds": round(time.time() - t0, 1), "log": log, "raw_log": raw_log,
+                        "seconds": elapsed_s, "log": log, "raw_log": raw_log,
                         "raw_lines": raw_lines, "compressed_lines": compressed_lines,
                         "raw_tokens": raw_tokens, "compressed_tokens": compressed_tokens, "saved_tokens": saved_tokens})
-        status_tag = ctext("✔ PASS", "green") if code == 0 else ctext("✘ FAIL", "red")
-        print(f"  {status_tag}  {c['name']:<14} {results[-1]['seconds']}s   {c['cmd']}")
+        status_tag = ctext("✔", "green") if code == 0 else ctext("✘", "red")
+        log_hint = ctext(f"  → {rel_log}", "dim") if (code != 0 and rel_log) else ""
+        print(f"  {status_tag} {c['name']:<14} ({elapsed_s}s){log_hint}")
     return results
 
 
@@ -2220,8 +2417,43 @@ def _render_runner_progress_bar(step: int, width: int = 16) -> str:
     return "".join(bar)
 
 
-def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int, list[str]]:
-    """Execute CLI runner, streaming stdout/stderr live while buffering lines for error analysis."""
+def clean_agent_stream_line(line: str, root: Path) -> str | None:
+    """Strip file:// markdown gibberish and render clean terminal text."""
+    if re.match(r"^\s*```[a-zA-Z0-9_-]*\s*$", line):
+        return None
+
+    def _replace_link(m: re.Match) -> str:
+        label = m.group(1).strip("`")
+        uri_path = m.group(2)
+        if uri_path.startswith("file://"):
+            raw_p = uri_path[len("file://"):]
+            try:
+                rel = Path(raw_p).resolve().relative_to(root.resolve()).as_posix()
+                if label in (Path(rel).name, rel) or label.endswith(".md"):
+                    return ctext(rel, "cyan")
+            except Exception:
+                pass
+        return ctext(label, "cyan")
+
+    out = re.sub(r"\[(`?[^\]\n]+`?)\]\((file://[^)\s]+)\)", _replace_link, line)
+    out = re.sub(r"\*\*([^*\n]+)\*\*", lambda m: ctext(m.group(1), "bold"), out)
+    out = re.sub(r"`([^`\n]+)`", lambda m: ctext(m.group(1), "cyan"), out)
+    out = re.sub(r"^\s*#{1,6}\s+(.+?)\s*$", lambda m: ctext(m.group(1), "bold"), out)
+    return out
+
+
+def execute_cli_runner(
+    runner: list[str],
+    prompt: str,
+    root: Path,
+    verbose: bool = False,
+    status_label: str = "",
+    model_id: str = "",
+    effort: str = "",
+    role_name: str = "",
+    expected_artifact: Path | None = None,
+) -> tuple[int, list[str]]:
+    """Execute CLI runner with live sequential step ticks or verbose stream."""
     captured: list[str] = []
     border = "─" * 70
     cmd = list(runner)
@@ -2230,12 +2462,29 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
         cmd.append("-p")
     cmd.append(prompt)
 
-    runner_cmd = " ".join(runner)
-    short_cmd = runner_cmd if len(runner_cmd) <= 46 else runner_cmd[:43] + "..."
-    box_title = f"│  🤖 Live Agent Stream: {short_cmd:<46}│"
-    print(ctext(f"┌{border}┐", "bold_blue"))
-    print(ctext(box_title, "bold_blue"))
-    print(ctext(f"├{border}┤\n", "bold_blue"))
+    def _vlen(s: str) -> int:
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", s)
+        extra = sum(1 for ch in clean if ord(ch) > 0x2000)
+        return len(clean) + extra
+
+    if verbose:
+        runner_cmd = " ".join(runner)
+        short_cmd = runner_cmd if len(runner_cmd) <= 46 else runner_cmd[:43] + "..."
+        title_content = f"  🤖 Live Agent Stream: {short_cmd}"
+        pad_title = max(0, 70 - _vlen(title_content))
+        box_title = f"│{title_content}{' ' * pad_title}│"
+
+        eff_model = model_id or "inherit"
+        model_badge = f"{eff_model} (effort: {effort})" if effort and eff_model != "inherit" else eff_model
+        meta_left = f"  🧠 Model: {model_badge}"
+        meta_right = f"Role: {role_name}  " if role_name else ""
+        pad_meta = max(0, 70 - _vlen(meta_left) - _vlen(meta_right))
+        box_meta = f"│{meta_left}{' ' * pad_meta}{meta_right}│"
+
+        print(ctext(f"┌{border}┐", "bold_blue"))
+        print(ctext(box_title, "bold_blue"))
+        print(ctext(box_meta, "bold_blue"))
+        print(ctext(f"├{border}┤\n", "bold_blue"))
 
     is_interactive_stream = sys.stdout.isatty() and use_color()
     start_time = time.time()
@@ -2246,32 +2495,122 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
         "step": 0,
         "streaming": False,
         "has_footer": False,
+        "step_status": "",
+        "printed_verify": False,
     }
+    artifact_ticked = False
+    initial_art_mtime = 0.0
+    if expected_artifact and expected_artifact.exists():
+        try:
+            initial_art_mtime = expected_artifact.stat().st_mtime
+        except Exception:
+            pass
+    steps_offset = 0
+    seen_passed_checks: set[str] = set()
+
+    eff_model = model_id or "inherit"
+    if eff_model != "inherit":
+        model_badge_short = f"[{eff_model}:{effort}]" if effort else f"[{eff_model}]"
+    else:
+        model_badge_short = "[inherit]"
+    model_tag = f"{model_badge_short} "
+
+    def _clear_footer_locked():
+        if is_interactive_stream and state["has_footer"]:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            state["has_footer"] = False
+
+    def _poll_live_steps_locked():
+        nonlocal artifact_ticked, steps_offset
+        if verbose:
+            return
+        if not artifact_ticked and expected_artifact and expected_artifact.exists():
+            try:
+                st_stat = expected_artifact.stat()
+                if st_stat.st_size > 0 and st_stat.st_mtime > initial_art_mtime:
+                    _clear_footer_locked()
+                    rel_art = expected_artifact.relative_to(root).as_posix()
+                    print(f"  {ctext('✔', 'green')} {expected_artifact.name} drafted {ctext(f'({rel_art})', 'dim')}")
+                    artifact_ticked = True
+            except Exception:
+                pass
+
+        sp_file = _live_steps_path(root)
+        if not sp_file.exists():
+            return
+        try:
+            with sp_file.open("r", encoding="utf-8", errors="replace") as sf:
+                sf.seek(steps_offset)
+                chunk = sf.read()
+                steps_offset = sf.tell()
+        except Exception:
+            return
+
+        for raw_line in chunk.splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                ev = json.loads(raw_line)
+            except Exception:
+                continue
+            kind = ev.get("kind")
+            event = ev.get("event")
+            name = ev.get("name", "")
+            if kind == "check" and event == "done":
+                ok = bool(ev.get("ok"))
+                if ok:
+                    if name not in seen_passed_checks:
+                        seen_passed_checks.add(name)
+                        _clear_footer_locked()
+                        print(f"  {ctext('✔', 'green')} Schema check ({name})")
+                else:
+                    cnt = ev.get("count", 1)
+                    _clear_footer_locked()
+                    print(f"  {ctext('✘', 'red')} Schema check ({name}) {ctext(f'({cnt} issue(s) — fixing...)', 'dim')}")
+            elif kind == "verify":
+                if event == "start":
+                    state["step_status"] = f"Running {name}..."
+                elif event == "done":
+                    state["step_status"] = ""
+                    ok = bool(ev.get("ok"))
+                    secs = ev.get("seconds", 0.0)
+                    log_rel = ev.get("log", "")
+                    _clear_footer_locked()
+                    tick = ctext("✔", "green") if ok else ctext("✘", "red")
+                    log_suffix = ctext(f"  → {log_rel}", "dim") if (not ok and log_rel) else ""
+                    print(f"  {tick} {name:<14} ({secs}s){log_suffix}")
+                    state["printed_verify"] = True
 
     def animation_worker():
         while not stop_event.is_set():
-            if is_interactive_stream:
-                with lock:
+            with lock:
+                _poll_live_steps_locked()
+                if is_interactive_stream:
                     elapsed = int(time.time() - start_time)
                     mins, secs = divmod(elapsed, 60)
                     time_str = f"{mins:02d}:{secs:02d}"
                     sp = spinner_frames[state["step"] % len(spinner_frames)]
                     bar = _render_runner_progress_bar(state["step"], 16)
-                    status = "Streaming agent output..." if state["streaming"] else "Agent thinking / initializing..."
-                    prefix = f"└─── [{bar}] {time_str} {sp} "
-                    fill_count = max(0, 68 - len(prefix) - len(status))
-                    footer_line = f"{prefix}{status} " + ("─" * fill_count) + "┘"
-                    styled_footer = ctext(footer_line, "bold_blue")
+                    if verbose:
+                        status = f"{model_tag}Streaming agent output..." if state["streaming"] else f"{model_tag}Agent thinking / initializing..."
+                        prefix = f"└─── [{bar}] {time_str} {sp} "
+                        fill_count = max(0, 68 - len(prefix) - len(status))
+                        footer_line = f"{prefix}{status} " + ("─" * fill_count) + "┘"
+                        styled_footer = ctext(footer_line, "bold_blue")
+                    else:
+                        base_lbl = status_label or (f"Working..." if state["streaming"] else f"Initializing agent...")
+                        status = state["step_status"] or f"{base_lbl} {model_badge_short}"
+                        styled_footer = ctext(f"  {sp} [{bar}] {time_str}  {status}", "cyan")
                     sys.stdout.write(f"\r\033[2K{styled_footer}")
                     sys.stdout.flush()
                     state["has_footer"] = True
                 state["step"] += 1
             time.sleep(0.08)
 
-    anim_thread = None
-    if is_interactive_stream:
-        anim_thread = threading.Thread(target=animation_worker, daemon=True)
-        anim_thread.start()
+    anim_thread = threading.Thread(target=animation_worker, daemon=True)
+    anim_thread.start()
 
     proc = None
     try:
@@ -2286,12 +2625,13 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
         if proc.stdout:
             for line in iter(proc.stdout.readline, ""):
                 with lock:
-                    if is_interactive_stream and state["has_footer"]:
-                        sys.stdout.write("\r\033[2K")
-                        state["has_footer"] = False
                     state["streaming"] = True
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
+                    if verbose:
+                        cleaned = clean_agent_stream_line(line, root)
+                        if cleaned is not None:
+                            _clear_footer_locked()
+                            sys.stdout.write(cleaned if cleaned.endswith("\n") else cleaned + "\n")
+                            sys.stdout.flush()
                 captured.append(line)
             proc.stdout.close()
         rc = proc.wait()
@@ -2312,13 +2652,15 @@ def execute_cli_runner(runner: list[str], prompt: str, root: Path) -> tuple[int,
         if anim_thread:
             anim_thread.join(timeout=0.3)
         with lock:
-            if is_interactive_stream and state["has_footer"]:
-                sys.stdout.write("\r\033[2K")
-            elapsed = int(time.time() - start_time)
-            mins, secs = divmod(elapsed, 60)
-            time_str = f"({mins:02d}:{secs:02d})"
-            fill_len = max(0, 68 - len(time_str) - 1)
-            print(ctext(f"\n└{'─' * fill_len} {time_str} ─┘", "bold_blue"))
+            _clear_footer_locked()
+            _poll_live_steps_locked()
+            if verbose:
+                elapsed = int(time.time() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                model_closing = f"{model_id} " if model_id and model_id != "inherit" else ""
+                time_str = f"({model_closing}{mins:02d}:{secs:02d})"
+                fill_len = max(0, 68 - len(time_str) - 1)
+                print(ctext(f"\n└{'─' * fill_len} {time_str} ─┘", "bold_blue"))
 
     return rc, captured
 
@@ -2477,6 +2819,90 @@ def resolve_and_prompt_phase_model(
     return default_model, default_effort
 
 
+def _summarize_review_findings(rbody: str) -> str:
+    if not rbody:
+        return ""
+    f_sec = L.section(rbody, "Findings")
+    counts = {"blocker": 0, "major": 0, "minor": 0, "nit": 0}
+    for line in f_sec.splitlines():
+        m = re.search(r"\[(blocker|major|minor|nit)\]", line, re.IGNORECASE)
+        if m:
+            counts[m.group(1).lower()] += 1
+    parts = [f"{n} {k}" for k, n in counts.items() if n > 0]
+    return " · ".join(parts)
+
+
+def print_artifact_completion_summary(
+    root: Path,
+    task_id: str,
+    tier: int,
+    role_name: str,
+    expected_artifact: Path,
+) -> None:
+    rel_art = expected_artifact.relative_to(root).as_posix()
+    wd = expected_artifact.parent
+    meta, body = L.read_meta(expected_artifact)
+
+    details = []
+    if role_name == "discovery":
+        assumptions = [
+            l for l in L.section(body, "Assumptions").splitlines()
+            if l.strip().startswith(("-", "*"))
+        ]
+        oq_sec = L.section(body, "Open Questions").strip()
+        oq_lines = [l.strip() for l in oq_sec.splitlines() if l.strip()]
+        unresolved = [l for l in oq_lines if l.startswith(("- [ ]", "* [ ]"))]
+        if assumptions:
+            details.append(f"{len(assumptions)} assumption{'s' if len(assumptions) != 1 else ''}")
+        if unresolved:
+            details.append(f"{len(unresolved)} open question{'s' if len(unresolved) != 1 else ''}")
+    elif role_name == "reviewer":
+        verdict = meta.get("verdict", "")
+        if verdict:
+            details.append(f"verdict: {verdict}")
+        f_sum = _summarize_review_findings(body)
+        if f_sum:
+            details.append(f_sum)
+
+    detail_suffix = ctext(f"  ({' · '.join(details)})", "dim") if details else ""
+
+    if role_name == "implementer":
+        vrec = L.verify_record(wd)
+        if vrec and vrec.get("passed"):
+            diff_short = str(vrec.get("diff_sha", ""))[:10]
+            print(f"\n{ctext('✔', 'bold_green')} Implementation verified {ctext(f'(diff {diff_short})', 'dim')}")
+        elif vrec and not vrec.get("passed"):
+            print(f"\n{ctext('✘', 'bold_red')} Verification checks failed")
+        else:
+            print(f"\n{ctext('✔', 'bold_green')} Artifact ready: {ctext(rel_art, 'cyan')}")
+        print(f"  Open in IDE:    {ctext(f'code {rel_art}', 'green')}")
+    else:
+        print(f"\n{ctext('✔', 'bold_green')} Artifact ready: {ctext(rel_art, 'cyan')}{detail_suffix}")
+        print(f"  Open in IDE:    {ctext(f'code {rel_art}', 'green')}")
+
+    print("")
+    if role_name == "discovery":
+        print("Discovery is ready for human approval:")
+        print(f"  {ctext('helm approve discovery', 'bold_cyan')}\n")
+    elif role_name == "planner":
+        print("Plan is ready for human approval:")
+        print(f"  {ctext('helm approve plan', 'bold_cyan')}\n")
+    elif role_name == "test-analyst":
+        print("Test plan ready. Continue to implementation:")
+        print(f"  {ctext('helm continue', 'bold_cyan')}\n")
+    elif role_name == "implementer":
+        vrec = L.verify_record(wd)
+        if vrec and vrec.get("passed"):
+            print("Ready for independent review:")
+            print(f"  {ctext('helm review', 'bold_cyan')}\n")
+        else:
+            print("Fix failing checks and re-verify:")
+            print(f"  {ctext('helm continue', 'bold_cyan')}\n")
+    elif role_name == "reviewer":
+        print("Final gate is ready for human approval:")
+        print(f"  {ctext('helm approve final', 'bold_cyan')}\n")
+
+
 def dispatch_role(
     root: Path,
     task_id: str,
@@ -2489,12 +2915,13 @@ def dispatch_role(
     manual: bool = False,
     model_override: str | None = None,
     effort_override: str | None = None,
+    verbose: bool = False,
 ):
     """Dispatch an AI agent role, running HELM_CLI_CMD if configured, or formatting the exact prompt."""
-    cfg = L.load_json(root / ".helm/config.json", {})
-    platforms = cfg.get("platforms", [])
-    if "antigravity" in platforms or (root / ".agents").exists():
-        ensure_antigravity_env(root)
+    if os.environ.get("HELM_VERBOSE", "").strip().lower() in ("1", "true", "yes"):
+        verbose = True
+
+    sync_repo_blueprint_docs(root, pol)
 
     wd_rel = f"{L.WORK_REL}/{task_id}"
     agent_target = get_agent_role_path(root, role_name)
@@ -2529,6 +2956,7 @@ def dispatch_role(
         f"You are the {role_name.capitalize()} role for HELM.",
         f"Steering: Reasoning Effort = {steering['reasoning_effort'].upper()}, Verbosity = {steering['verbosity'].upper()}.",
         "Governance Rules: Human gates are strictly human-operated; never commit, push, or alter git branches; keep artifact modifications inside the assigned workspace.",
+        "Direct Artifact Execution (AGENTS.md Precedence Over Global Planning-First / Execution-Gate Rules): The user's CLI command IS explicit confirmation to execute this phase immediately in this single headless turn (`-p`). Do NOT output a conversational 4-part plan (Understanding & Scope / Proposed Approach / Alternatives & Trade-offs / Open Questions) and do NOT stop to ask 'Please confirm if you approve proceeding...' before creating files. If two options are materially deadlocked and require human choice, write `.helm/work/<ID>/BLOCKED.md`; otherwise execute the recommended option (Option A), write the target artifact file directly to disk now, and run `helm check` in this turn (`helm approve` is the human gate).",
     ]
     if role_name == "discovery":
         tier1_blocks.append("Duty: Draft WORK.md based on .helm/templates/WORK.md. Run `helm check WORK` until clean, then inform the user that discovery is ready for approval: `helm approve discovery`.")
@@ -2570,44 +2998,43 @@ def dispatch_role(
     prompt_lines = tier1_blocks + tier2_blocks + tier3_blocks
     full_prompt = "\n\n".join(prompt_lines)
 
-    border = "─" * 70
-    print(ctext(f"\n┌{border}┐", "cyan"))
-    header = f"  HELM Agent Dispatch: {role_name.upper()}  "
-    print(ctext(f"│{header:<70}│", "bold"))
-    print(ctext(f"├{border}┤", "cyan"))
-    for label, val in [
-        ("Task ID", f"{task_id} ({tier_desc})"),
-        ("Phase", phase),
-        ("Model", f"{chosen_model} (effort: {chosen_effort})"),
-        ("Role Spec", spec_rel),
-        ("Workspace", f"{wd_rel}/"),
-    ]:
-        row = f"  {label:<16}: {val}"
-        print(f"│{row:<70}│")
-    if story_file and story_file.exists():
-        sf_row = f"  {'Story File':<16}: {wd_rel}/STORY.md"
-        print(f"│{sf_row:<70}│")
-    print(ctext(f"├{border}┤", "cyan"))
-    prompt_hdr = "  👉 Exact Agent Prompt:"
-    print(ctext(f"│{prompt_hdr:<70}│", "bold"))
-    empty_row = ""
-    for block in prompt_lines:
-        for subline in block.splitlines():
-            if not subline.strip():
-                print(f"│{empty_row:<70}│")
-                continue
-            wrapped = textwrap.wrap(subline, width=64, break_long_words=False, break_on_hyphens=False) or [subline]
-            for wline in wrapped:
-                pline_str = f"    {wline}"
-                print(f"│{pline_str:<70}│")
-        print(f"│{empty_row:<70}│")
-    print(ctext(f"└{border}┘\n", "cyan"))
-
     runner = get_cli_runner(root, model_id=chosen_model, effort=chosen_effort) if not manual else None
-    if runner:
-        print(ctext(f"🚀 Launching CLI runner: {' '.join(runner)} ...\n", "green"))
-        rc, output_lines = execute_cli_runner(runner, full_prompt, root)
 
+    if not runner or verbose:
+        border = "─" * 70
+        print(ctext(f"\n┌{border}┐", "cyan"))
+        header = f"  HELM Agent Dispatch: {role_name.upper()}  "
+        print(ctext(f"│{header:<70}│", "bold"))
+        print(ctext(f"├{border}┤", "cyan"))
+        for label, val in [
+            ("Task ID", f"{task_id} ({tier_desc})"),
+            ("Phase", phase),
+            ("Model", f"{chosen_model} (effort: {chosen_effort})"),
+            ("Role Spec", spec_rel),
+            ("Workspace", f"{wd_rel}/"),
+        ]:
+            row = f"  {label:<16}: {val}"
+            print(f"│{row:<70}│")
+        if story_file and story_file.exists():
+            sf_row = f"  {'Story File':<16}: {wd_rel}/STORY.md"
+            print(f"│{sf_row:<70}│")
+        print(ctext(f"├{border}┤", "cyan"))
+        prompt_hdr = "  👉 Exact Agent Prompt:"
+        print(ctext(f"│{prompt_hdr:<70}│", "bold"))
+        empty_row = ""
+        for block in prompt_lines:
+            for subline in block.splitlines():
+                if not subline.strip():
+                    print(f"│{empty_row:<70}│")
+                    continue
+                wrapped = textwrap.wrap(subline, width=64, break_long_words=False, break_on_hyphens=False) or [subline]
+                for wline in wrapped:
+                    pline_str = f"    {wline}"
+                    print(f"│{pline_str:<70}│")
+            print(f"│{empty_row:<70}│")
+        print(ctext(f"└{border}┘\n", "cyan"))
+
+    if runner:
         expected_artifact = None
         if role_name == "discovery":
             expected_artifact = root / wd_rel / "WORK.md"
@@ -2620,40 +3047,122 @@ def dispatch_role(
         elif role_name == "reviewer":
             expected_artifact = root / wd_rel / "REVIEW.md"
 
-        blocked_artifact = root / wd_rel / "BLOCKED.md"
-        is_blocked = bool(blocked_artifact.exists() and blocked_artifact.stat().st_size > 0)
-        has_artifact = bool(expected_artifact and expected_artifact.exists() and expected_artifact.stat().st_size > 0)
-
-        combined_out = "\n".join(output_lines).lower()
-        soft_failure = any(
-            err in combined_out
-            for err in (
-                "no output produced",
-                "permission that headless mode cannot prompt for",
-                "so it was auto-denied",
-                "permissions.allow",
-            )
-        )
-
-        if rc != 0 or (soft_failure and not has_artifact and not is_blocked):
-            eff_rc = rc if rc != 0 else 1
-            print(format_runner_diagnostics(runner, eff_rc, output_lines, role_name, task_id))
-            sys.exit(eff_rc)
-        elif is_blocked:
-            print(ctext(f"\n⚠️  Agent encountered a block: {blocked_artifact.relative_to(root)} was created.", "bold_orange"))
-            print(ctext("   Inspect BLOCKED.md and resolve it with `helm unblock -m '...'`.\n", "dim"))
-            _show_status()
-            sys.exit(0)
-        elif has_artifact:
-            print(ctext(f"\n✔ {role_name.capitalize()} completed: {expected_artifact.relative_to(root)} produced.", "bold_green"))
-            _show_status()
-            sys.exit(0)
+        phase_labels = {
+            "discovery": f"Running Discovery ({task_id})...",
+            "planner": f"Running Planner ({task_id})...",
+            "test-analyst": f"Running Test Analyst ({task_id})...",
+            "implementer": f"Implementing {task_id}...",
+            "reviewer": f"Reviewing {task_id}...",
+        }
+        header_lbl = phase_labels.get(role_name, f"Running {role_name} ({task_id})...")
+        if verbose:
+            print(ctext(f"🚀 Launching CLI runner: {' '.join(runner)} ...\n", "green"))
         else:
-            art_name = str(expected_artifact.relative_to(root)) if expected_artifact else "expected artifact"
-            print(ctext(f"\n⚠️  Agent session concluded, but {art_name} was not created.", "bold_orange"))
-            print(ctext("   Review agent output above. If the agent requested human clarification or encountered a block,", "dim"))
-            print(ctext("   address it, then re-run to continue.\n", "dim"))
-            sys.exit(1)
+            eff_model_hdr = chosen_model or "inherit"
+            if eff_model_hdr != "inherit":
+                model_hdr_badge = f"({eff_model_hdr}, effort: {chosen_effort})" if chosen_effort else f"({eff_model_hdr})"
+            else:
+                model_hdr_badge = "(inherit)"
+            print(f"\n{ctext(header_lbl, 'bold')} {ctext(model_hdr_badge, 'dim')}")
+
+        max_continuations = 3
+        continuation_turn = 0
+        current_prompt = full_prompt
+
+        while True:
+            _clear_live_steps(root)
+            rc, output_lines = execute_cli_runner(
+                runner,
+                current_prompt,
+                root,
+                verbose=verbose,
+                status_label=header_lbl,
+                model_id=chosen_model,
+                effort=chosen_effort,
+                role_name=role_name,
+                expected_artifact=expected_artifact,
+            )
+
+            blocked_artifact = root / wd_rel / "BLOCKED.md"
+            is_blocked = bool(blocked_artifact.exists() and blocked_artifact.stat().st_size > 0)
+            has_artifact = bool(expected_artifact and expected_artifact.exists() and expected_artifact.stat().st_size > 0)
+
+            combined_out = "\n".join(output_lines).lower()
+            soft_failure = any(
+                err in combined_out
+                for err in (
+                    "no output produced",
+                    "permission that headless mode cannot prompt for",
+                    "so it was auto-denied",
+                    "permissions.allow",
+                )
+            )
+
+            if rc != 0 or (soft_failure and not has_artifact and not is_blocked):
+                eff_rc = rc if rc != 0 else 1
+                print(format_runner_diagnostics(runner, eff_rc, output_lines, role_name, task_id))
+                sys.exit(eff_rc)
+            elif is_blocked:
+                print(ctext(f"\n⚠️  Agent encountered a block: {blocked_artifact.relative_to(root)} was created.", "bold_orange"))
+                print(ctext("   Inspect BLOCKED.md and resolve it with `helm unblock -m '...'`.\n", "dim"))
+                _show_status()
+                sys.exit(0)
+            elif has_artifact:
+                if verbose:
+                    print(ctext(f"\n✔ {role_name.capitalize()} completed: {expected_artifact.relative_to(root)} produced.", "bold_green"))
+                    _show_status()
+                else:
+                    print_artifact_completion_summary(root, task_id, tier, role_name, expected_artifact)
+                sys.exit(0)
+            else:
+                art_name = str(expected_artifact.relative_to(root)) if expected_artifact else "expected artifact"
+                art_short = expected_artifact.name if expected_artifact else "artifact"
+                check_target = expected_artifact.stem if expected_artifact else ""
+                if not verbose and output_lines:
+                    print(ctext("\n─── Agent Output ──────────────────────────────────────────────────────", "dim"))
+                    for raw_ln in output_lines[-35:]:
+                        cleaned_ln = clean_agent_stream_line(raw_ln.rstrip("\n"), root)
+                        if cleaned_ln is not None:
+                            print(f"  {cleaned_ln}")
+                    print(ctext("───────────────────────────────────────────────────────────────────────", "dim"))
+
+                if is_interactive() and continuation_turn < max_continuations:
+                    continuation_turn += 1
+                    print(ctext(f"\n⚠️  Agent paused without creating {art_name} (awaiting confirmation).", "bold_orange"))
+                    ans = prompt_user(
+                        f"? Reply to agent [Press Enter to approve recommended option & write {art_short}, type reply, or 'q' to quit]: "
+                    ).strip()
+                    if ans.lower() in ("q", "quit", "exit", "stop", "n", "no"):
+                        print(ctext(f"   Stopped without creating {art_name}.\n", "dim"))
+                        sys.exit(1)
+                    if not ans or ans.lower() in ("y", "yes", "ok", "confirm", "approve", "a", "option a"):
+                        reply_directive = (
+                            f"USER CONFIRMATION: Approved. Proceed immediately with your recommended option (Option A if options were listed). "
+                            f"Write `{art_name}` directly to disk now and run `helm check {check_target}`. "
+                            f"Do NOT ask for any further confirmation."
+                        )
+                    else:
+                        reply_directive = (
+                            f"USER CONFIRMATION / INSTRUCTION: {ans}\n"
+                            f"Proceed immediately based on this instruction. Write `{art_name}` directly to disk now and run "
+                            f"`helm check {check_target}` without asking for further confirmation."
+                        )
+                    tail_context = "\n".join(line.rstrip("\n") for line in output_lines[-40:]).strip()
+                    current_prompt = (
+                        f"{full_prompt}\n\n"
+                        f"Previous Agent Output (already reviewed by human):\n{tail_context}\n\n"
+                        f"{reply_directive}"
+                    )
+                    header_lbl = f"Continuing {role_name} ({task_id})..."
+                    if verbose:
+                        print(ctext(f"\n🚀 Continuing CLI runner with confirmation ({continuation_turn}/{max_continuations})...\n", "green"))
+                    else:
+                        print(f"\n{ctext(header_lbl, 'bold')}")
+                    continue
+
+                print(ctext(f"\n⚠️  Agent session concluded, but {art_name} was not created.", "bold_orange"))
+                print(ctext("   Re-run with `--verbose` to inspect raw agent output.\n", "dim"))
+                sys.exit(1)
     else:
         slash_cmd = "/work " + task_id if role_name == "discovery" else ("/review" if role_name == "reviewer" else "/continue")
         if manual:
@@ -2698,10 +3207,11 @@ def cmd_work(a):
 
     # 2. Check phase
     manual = getattr(a, "manual", False)
+    verbose = getattr(a, "verbose", False)
     model_ov = getattr(a, "model", None)
     effort_ov = getattr(a, "effort", None)
     if phase == "DISCOVERY":
-        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "AWAITING_DISCOVERY_APPROVAL":
         print(ctext(f"Discovery complete for task {task_id}. Awaiting human approval:", "bold_orange"))
         print(f"Review {info['work_dir']}/WORK.md, then decide:")
@@ -2732,18 +3242,19 @@ def cmd_continue(a):
     wd = root / info["work_dir"]
     story_file = wd / "STORY.md"
     manual = getattr(a, "manual", False)
+    verbose = getattr(a, "verbose", False)
     model_ov = getattr(a, "model", None)
     effort_ov = getattr(a, "effort", None)
 
     if phase == "DISCOVERY":
         print(ctext(f"Task is in DISCOVERY phase. Dispatching discovery role...", "cyan"))
-        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "discovery", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "PLANNING":
-        dispatch_role(root, task_id, tier, phase, "planner", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "planner", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "TEST_ANALYSIS":
-        dispatch_role(root, task_id, tier, phase, "test-analyst", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "test-analyst", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "IMPLEMENTATION":
-        dispatch_role(root, task_id, tier, phase, "implementer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "implementer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "VERIFICATION":
         vrec = L.load_json(wd / "VERIFY.json", {}) or {}
         failed_checks = [c["name"] for c in vrec.get("checks", []) if c.get("exit") != 0 and c.get("required")]
@@ -2752,12 +3263,12 @@ def cmd_continue(a):
         notes = ""
         if failed_checks:
             notes = f"Fix failing verification checks: {', '.join(failed_checks)}. See logs in {info['work_dir']}/verify/"
-        dispatch_role(root, task_id, tier, phase, "implementer", context_notes=notes, story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "implementer", context_notes=notes, story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase == "REVIEW":
         trec = L.load_task(root, task_id)
         if trec and "baseline" in trec:
             L.generate_diff_digest(root, task_id, trec["baseline"]["head"], wd, pol)
-        dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+        dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
     elif phase in GATE_PHASE.values():
         gate = next((g for g, p in GATE_PHASE.items() if p == phase), None)
         print(ctext(f"Cannot continue: task is awaiting human approval for '{gate}'.", "bold_orange"))
@@ -2769,7 +3280,12 @@ def cmd_continue(a):
         print(f"Inspect {info['work_dir']}/BLOCKED.md and unblock via: " + ctext("helm unblock -m \"Decision: ...\"", "cyan"))
     elif phase == "READY_FOR_DEVELOPER":
         print(ctext("All agent phases complete! Developer turn:", "green"))
-        print(f"Review `git diff`, commit the changes, then complete task via: " + ctext("helm finish", "cyan"))
+        has_changes = bool(L.git_out(root, ["status", "--porcelain"]))
+        if has_changes:
+            print(f"Review `git diff`, commit the changes, then complete task via: " + ctext("helm finish", "cyan"))
+        else:
+            print(ctext("⚠ Warning: Working tree is clean (no uncommitted changes produced).", "bold_orange"))
+            print(f"If changes were already committed, inspect git history. Complete task via: " + ctext("helm finish", "cyan"))
     else:
         st = build_status(root, pol)
         print_status(st)
@@ -2787,6 +3303,7 @@ def cmd_review(a):
     wd = root / info["work_dir"]
     story_file = wd / "STORY.md"
     manual = getattr(a, "manual", False)
+    verbose = getattr(a, "verbose", False)
     model_ov = getattr(a, "model", None)
     effort_ov = getattr(a, "effort", None)
 
@@ -2797,7 +3314,7 @@ def cmd_review(a):
     if trec and "baseline" in trec:
         L.generate_diff_digest(root, task_id, trec["baseline"]["head"], wd, pol)
 
-    dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov)
+    dispatch_role(root, task_id, tier, phase, "reviewer", story_file=story_file, pol=pol, manual=manual, model_override=model_ov, effort_override=effort_ov, verbose=verbose)
 
 
 def cmd_approve(a):
@@ -2807,13 +3324,11 @@ def cmd_approve(a):
     task = active["task"]
     tier = info["tier"]
 
-    gate_auto = False
     if not getattr(a, "gate", None):
         if not is_interactive() and not _has_tty():
             die("gate is required in non-interactive mode: helm approve discovery|plan|final")
         if info["phase"] in PHASE_TO_GATE:
             a.gate = PHASE_TO_GATE[info["phase"]]
-            gate_auto = True
         else:
             die(f"active task is in phase '{info['phase']}'; no gate is pending approval")
 
@@ -2836,57 +3351,70 @@ def cmd_approve(a):
         line_count = len(art_path.read_text(encoding="utf-8", errors="replace").splitlines())
         print(f"Artifact    : {ctext(L.SPECS[name]['file'], 'cyan')}  sha {art_sha_val}  ({line_count} lines)")
         print(f"Open in IDE : {ctext(f'code {art_path.relative_to(root)}', 'green')}")
-        print(f"[inferred] tags: {body.count('[inferred]')}   assumptions: {len([l for l in L.section(body, 'Assumptions').splitlines() if l.strip().startswith(('-', '*'))])}")
+        inferred_count = body.count("[inferred]")
+        assumption_count = len([l for l in L.section(body, "Assumptions").splitlines() if l.strip().startswith(("-", "*"))])
+        if inferred_count > 0 or assumption_count > 0:
+            parts = []
+            if inferred_count > 0:
+                parts.append(f"[inferred] tags: {inferred_count}")
+            if assumption_count > 0:
+                parts.append(f"assumptions: {assumption_count}")
+            print("   ".join(parts))
         oq = L.section(body, "Open Questions")
-        unresolved = [l for l in oq.splitlines() if l.strip().startswith(("- [ ]", "* [ ]"))]
-        print("Open questions:\n  " + ("\n  ".join(unresolved) if unresolved else (oq.strip()[:200] or "(none stated)")))
+        lines = [l.strip() for l in oq.splitlines() if l.strip()]
+        unresolved = [l for l in lines if l.startswith(("- [ ]", "* [ ]"))]
+        resolved = [l for l in lines if l.startswith(("- [x]", "* [x]", "- [X]", "* [X]"))]
+        clean_oq = oq.strip()
+        is_none_oq = (
+            not clean_oq
+            or clean_oq.lower() in ("none", "none.", "n/a", "(none)", "(none stated)")
+            or re.match(r"^(?:none|n/a)\b", clean_oq, re.IGNORECASE) is not None
+        )
+        if unresolved:
+            print("Open questions:\n  " + "\n  ".join(unresolved))
+        elif resolved:
+            print("Open questions:\n  (all resolved)")
+        elif not is_none_oq:
+            print(f"Open questions:\n  {clean_oq[:200]}")
         if gate == "discovery" and tier == 1:
             print("Tier 1: approving brief AND plan together (## Plan section).")
         if unresolved:
             extra = "accept open questions"
     else:
         diff = info["diff_sha"]
-        trec = L.load_task(root, task)
-        print(L.git_out(root, ["diff", "--stat", trec["baseline"]["head"], "--"]) or "(no tracked changes)")
-        untracked = L.git_out(root, ["ls-files", "--others", "--exclude-standard"]).splitlines()
-        if untracked:
-            print("New files: " + ", ".join(untracked[:15]))
         V = L.verify_record(wd)
-        print("Verification: " + ("PASSED" if V and V["passed"] else "NOT PASSED") + " — " + ", ".join(f"{c['name']}={'ok' if c['exit'] == 0 else 'FAIL'}" for c in (V or {}).get("checks", [])))
-        rmeta, rbody = L.read_meta(wd / "REVIEW.md") if (wd / "REVIEW.md").exists() else ({}, "")
+        v_checks = ", ".join(c["name"] for c in (V or {}).get("checks", []))
+        v_status = ("PASSED" if V and V["passed"] else "NOT PASSED") + (f" ({v_checks})" if v_checks else "")
+        rev_path = wd / "REVIEW.md"
+        rmeta, rbody = L.read_meta(rev_path) if rev_path.exists() else ({}, "")
         verdict = rmeta.get("verdict", "(no review for this diff)")
-        if (wd / "REVIEW.md").exists():
-            rev_rel = (wd / "REVIEW.md").relative_to(root)
-            print(f"Open in IDE : {ctext(f'code {rev_rel}', 'green')}")
-        if (wd / "REVIEW.md").exists() and rmeta.get("diff_sha") == diff:
+        if rev_path.exists() and rmeta.get("diff_sha") == diff:
             rprobs = L.validate(wd, "REVIEW", tier, root)
             if rprobs:
                 die("REVIEW.md fails validation:\n  " + "\n  ".join(rprobs))
             tr = L.traceability(root, wd)
             c = tr["counts"]
-            print(f"Traceability: {tr['criteria']} criteria → {c['pass']} proven by a test file, {c['manual']} manual, {c['unproven']} unproven, {c['fail']} failing")
-        print(f"Review verdict: {verdict}")
-        if rbody:
-            print("  " + "\n  ".join(L.section(rbody, "Findings").splitlines()[:14]))
+            passed_ac = c["pass"] + c["manual"]
+            f_sum = _summarize_review_findings(rbody)
+            f_str = f" · {f_sum}" if f_sum else ""
+            print(f"Artifact     : {ctext('REVIEW.md', 'cyan')}  verdict: {ctext(verdict, 'bold')}  ({passed_ac}/{tr['criteria']} criteria pass{f_str})")
+        else:
+            print(f"Review verdict: {verdict}")
+        print(f"Verification : {v_status}")
+        if rev_path.exists():
+            rev_rel = rev_path.relative_to(root)
+            print(f"Open in IDE  : {ctext(f'code {rev_rel}', 'green')}")
         if verdict == "CHANGES_REQUIRED" and not a.override:
             die("reviewer says CHANGES_REQUIRED. Reject with `helm reject final -m ...`, or approve anyway with --override.")
-        pfile = wd / ("PLAN.md" if L.tier_cfg(pol, tier)["plan_stage"] else "WORK.md")
-        pbody = L.read_meta(pfile)[1]
-        planned = section_paths(L.section(pbody, "Files Likely To Change" if pfile.name == "PLAN.md" else "Plan"))
-        unplanned = [f for f in L.changed_files(root, trec["baseline"]["head"]) if planned and not is_planned(f, planned)]
-        if unplanned:
-            print("SCOPE: files changed that the approved plan did not list:\n  " + "\n  ".join(unplanned[:20]))
 
-    if gate_auto:
-        ans = prompt_user(f"\nApprove {gate} for task {task}? [y/N]: ").strip().lower()
-        if ans not in ("y", "yes"):
-            die("not confirmed — nothing recorded")
-    else:
-        if not confirm(f"\nType the task id ({task}) to approve the {gate} gate: ", task):
-            die("not confirmed — nothing recorded")
-
-    if extra and not confirm(f"Open questions remain. Type '{extra}' to proceed anyway: ", extra):
+    ans = ask_tty(f"\nApprove {gate} gate for {task}? [Y/n]: ").strip().lower()
+    if ans not in ("", "y", "yes", task.lower()):
         die("not confirmed — nothing recorded")
+
+    if extra:
+        ans_oq = ask_tty("Unresolved open questions remain. Proceed anyway? [y/N]: ").strip().lower()
+        if ans_oq not in ("y", "yes", extra):
+            die("not confirmed — nothing recorded")
     inputs = L.final_inputs(wd, info["diff_sha"]) if gate == "final" else L.gate_inputs(wd, gate)
     L.append_record(root, task, {"gate": gate, "decision": "approve", "inputs": inputs, "user": identity(root), "note": "override" if a.override else ""})
     decision_md(root, task)
@@ -3299,9 +3827,8 @@ def cmd_finish(a):
     trec = L.load_task(root, active["task"])
     gv = L.git_violations(trec["baseline"]["git"], L.git_snapshot(root))
     if gv:
-        print("note: Git state differs from task start (" + ", ".join(gv) + ") — expected if you already committed.")
-    if not confirm(f"Type the task id ({active['task']}) to finish: ", active["task"]):
-        die("not confirmed")
+        print(ctext("note: Git state differs from task start (" + ", ".join(gv) + ") — expected if you already committed.", "dim"))
+    print(ctext(f"\n✔ Finishing task {active['task']}...", "bold_green"))
     cands = L.decision_candidates(root, active["task"])
     if cands:
         log = pol.get("decisions_log", "docs/decisions.md")
@@ -3334,10 +3861,11 @@ def cmd_finish(a):
     if a.clean:
         print(log)
         shutil.rmtree(wd, ignore_errors=True)
-        print(f"\nremoved {info['work_dir']}")
+        print(ctext(f"\n✔ Removed task artifacts: {info['work_dir']}/", "green"))
     else:
-        print(f"kept {info['work_dir']}/ (gitignored). Remove later with: rm -r {info['work_dir']}")
-    print("AI work ended. You own the branch: commit, push and open the PR yourself.")
+        print(ctext(f"\n📁 Preserved task artifacts in {info['work_dir']}/ (gitignored) for PR reference.", "cyan"))
+        print(ctext(f"   Remove whenever ready with: rm -r {info['work_dir']} (or 'helm finish --clean')", "dim"))
+    print(ctext("\n🚀 AI work ended. You own the branch: commit, push and open the PR yourself.\n", "bold"))
 
 
 def cmd_baseline(a):
@@ -3856,7 +4384,12 @@ def cmd_learn(a):
     if apply_now:
         res = L.apply_learnings_to_overlay(root, pol, task_id, learnings)
         print(ctext(f"\n✔ Applied {len(res['conventions_added'])} conventions and {len(res['couplings_added'])} file couplings to overlay", "green"))
-        print(ctext("✔ Overlay integrity re-signed (.helm/state/integrity.json)", "green"))
+        integ_path = L.integrity_path(root)
+        try:
+            rel_display = f"~/{integ_path.relative_to(Path.home())}"
+        except ValueError:
+            rel_display = str(integ_path)
+        print(ctext(f"✔ Overlay integrity re-signed ({rel_display})", "green"))
     else:
         print(ctext("\nSkipped applying learnings.", "dim"))
 
@@ -3943,6 +4476,7 @@ def main():
     s.add_argument("--model", default=None, help="Model override for discovery phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
     s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
     s.add_argument("--manual", action="store_true", help="Print discovery prompt only without auto-executing CLI runner")
+    s.add_argument("-v", "--verbose", action="store_true", help="Stream full raw agent output and prompt box")
     s.add_argument("--no-work", dest="no_work", action="store_true", help="Register task only without auto-launching discovery (helm work)")
     s.set_defaults(f=cmd_start)
 
@@ -3952,18 +4486,21 @@ def main():
     s.add_argument("--model", default=None, help="Model override for this phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
     s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
     s.add_argument("--manual", action="store_true", help="Print prompt only without auto-executing CLI runner")
+    s.add_argument("-v", "--verbose", action="store_true", help="Stream full raw agent output and prompt box")
     s.set_defaults(f=cmd_work)
 
     s = sp.add_parser("continue", help="Dispatch active agent role in workflow")
     s.add_argument("--model", default=None, help="Model override for this phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
     s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
     s.add_argument("--manual", action="store_true", help="Print prompt only without auto-executing CLI runner")
+    s.add_argument("-v", "--verbose", action="store_true", help="Stream full raw agent output and prompt box")
     s.set_defaults(f=cmd_continue)
 
     s = sp.add_parser("review", help="Dispatch independent reviewer role")
     s.add_argument("--model", default=None, help="Model override for this phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
     s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
     s.add_argument("--manual", action="store_true", help="Print prompt only without auto-executing CLI runner")
+    s.add_argument("-v", "--verbose", action="store_true", help="Stream full raw agent output and prompt box")
     s.set_defaults(f=cmd_review)
 
     s = sp.add_parser("status", help="Inspect workflow phase and write scope")

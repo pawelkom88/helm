@@ -784,6 +784,20 @@ def validate(wd: Path, name: str, tier: int = 2, root=None):
             probs.append("invisible/bidirectional Unicode control characters detected in artifact (obfuscation risk)")
         if ARTIFACT_INJECTION_RE.search(body):
             probs.append("prompt-injection override phrase or fake instruction boundary tag detected in artifact")
+        if name == "IMPL":
+            allow_empty = str(meta.get("allow_empty_diff", "")).lower() in ("true", "1")
+            if not allow_empty:
+                trec = load_task(root, wd.name)
+                if trec and "baseline" in trec:
+                    base_head = trec["baseline"]["head"]
+                    mod_files = set(changed_files(root, base_head))
+                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+                    repo_src_changes = [f for f in mod_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes)]
+                    if not repo_src_changes:
+                        probs.append(
+                            "IMPL cannot be marked ready: 0 repository source files were modified relative to task baseline. "
+                            "Agents must write changes to the working tree for developer review (or set allow_empty_diff: true in front matter if verification-only)."
+                        )
         if name == "WORK" and not section(body, "Acceptance Criteria"):
             probs.append("Acceptance Criteria is empty")
         if name == "REVIEW":
@@ -791,6 +805,24 @@ def validate(wd: Path, name: str, tier: int = 2, root=None):
                 probs.append("REVIEW front matter `verdict` must be APPROVE|CHANGES_REQUIRED|BLOCKED")
             if not meta.get("diff_sha"):
                 probs.append("REVIEW front matter `diff_sha` is required (from `helm status --json`)")
+            allow_empty = str(meta.get("allow_empty_diff", "")).lower() in ("true", "1")
+            if not allow_empty:
+                impl_p = wd / "IMPL.md"
+                if impl_p.exists():
+                    imeta, _ = read_meta(impl_p)
+                    allow_empty = str(imeta.get("allow_empty_diff", "")).lower() in ("true", "1")
+            if meta.get("verdict") == "APPROVE" and not allow_empty:
+                trec = load_task(root, wd.name)
+                if trec and "baseline" in trec:
+                    base_head = trec["baseline"]["head"]
+                    mod_files = set(changed_files(root, base_head))
+                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+                    repo_src_changes = [f for f in mod_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes)]
+                    if not repo_src_changes:
+                        probs.append(
+                            "verdict cannot be APPROVE when 0 repository source files were modified relative to task baseline. "
+                            "Use CHANGES_REQUIRED or BLOCKED (agents cannot approve tasks without working tree changes)."
+                        )
             tr = traceability(root, wd)
             probs += tr["problems"]
             bad = tr["counts"]["fail"] + tr["counts"]["unproven"]

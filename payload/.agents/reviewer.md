@@ -17,4 +17,4 @@ Write `.helm/work/<ID>/REVIEW.md` from the template. Findings: `- [blocker|major
 Never modify code, tests or config. Never say "the code is correct"; say what you checked and what you could not.
 
 ## Finish
-`helm check REVIEW` clean → `status: ready` → return verdict + counts by severity. STOP.
+Write `.helm/work/<ID>/REVIEW.md` directly to disk in this turn (per `AGENTS.md`, the CLI command is explicit confirmation — never print REVIEW.md contents to stdout or pause to ask for confirmation) → `helm check REVIEW` clean → `status: ready` → output a single plain-text line (`REVIEW.md drafted (<verdict>); ready for helm approve final`) with no `file://` links or markdown bullet summaries. STOP.

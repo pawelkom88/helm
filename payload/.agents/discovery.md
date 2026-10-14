@@ -27,4 +27,4 @@ Use the Atlassian MCP's read tools only. Never write to Jira/Confluence.
 - Tier 1: also add a `## Plan` section (approach, files to change as backticked paths, tests) — the human approves brief and plan together.
 
 ## Finish
-`helm check WORK` until clean → set front matter `status: ready` → return to the parent: ≤8 lines (scope, existing components found, count of assumptions/open questions, whether Confluence was used and why) plus any questions that need the human's judgement now. STOP. Never approve.
+Write `.helm/work/<ID>/WORK.md` directly to disk in this turn (per `AGENTS.md`, the CLI command is explicit confirmation — never print WORK.md to stdout or pause to ask for confirmation) → `helm check WORK` until clean → set front matter `status: ready` → output a single plain-text line (`WORK.md drafted; ready for helm approve discovery`) with no `file://` links or markdown bullet summaries. STOP. Never approve.

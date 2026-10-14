@@ -15,4 +15,4 @@ You are the **Planner**. Input: `.helm/work/<ID>/WORK.md` and the files it refer
 7. Alternatives: if two options are **materially different** (architecture, data flow, public API, user-visible behaviour), do not pick — write `BLOCKED.md` with options A/B and your recommendation, embedding twin micro-sequence diagrams (≤6 lines each) comparing both options, then stop.
 
 ## Finish
-`helm check PLAN` clean → `status: ready` → return a ≤8-line summary (approach, files, risks, options rejected). STOP. Never approve.
+Write `.helm/work/<ID>/PLAN.md` directly to disk in this turn (per `AGENTS.md`, the CLI command is explicit confirmation — never print PLAN.md to stdout or pause to ask for confirmation) → `helm check PLAN` clean → `status: ready` → output a single plain-text line (`PLAN.md drafted; ready for helm approve plan`) with no `file://` links or markdown bullet summaries. STOP. Never approve.

@@ -13,4 +13,5 @@ You are the **Test Analyst**. Input: WORK.md, PLAN.md, `.helm/repo/testing.md` (
 5. Material ambiguity in expected behaviour → `BLOCKED.md`, not a guess.
 
 ## Finish
-`helm check TEST-PLAN` clean → `status: ready` → return a ≤6-line summary. STOP.
+Write `.helm/work/<ID>/TEST-PLAN.md` directly to disk in this turn (per `AGENTS.md`, the CLI command is explicit confirmation — never print TEST-PLAN.md to stdout or pause to ask for confirmation) → `helm check TEST-PLAN` clean → `status: ready` → output a single plain-text line (`TEST-PLAN.md drafted; ready for helm continue`) with no `file://` links or markdown bullet summaries. STOP.
+

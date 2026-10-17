@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .helm/bin/helm_guard.py tool --platform copilot",
+        "bash": "python3 .helm/bin/helm_guard.py tool --platform copilot",
+        "powershell": "python .helm/bin/helm_guard.py tool --platform copilot",
+        "timeout": 30,
+        "timeoutSec": 30
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "command": "python3 .helm/bin/helm_guard.py tool --platform copilot",
+        "bash": "python3 .helm/bin/helm_guard.py tool --platform copilot",
+        "powershell": "python .helm/bin/helm_guard.py tool --platform copilot",
+        "timeout": 30,
+        "timeoutSec": 30
+      }
+    ]
+  }
+}

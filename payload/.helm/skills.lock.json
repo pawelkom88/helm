@@ -69,6 +69,20 @@
       "has_scripts": false
     },
     {
+      "name": "state-machines",
+      "source": "bundled:helm-vscode-kit",
+      "commit": "c4d1e2f0",
+      "license": "MIT",
+      "reviewer": "bundled",
+      "approved": "2026-10-11",
+      "scope": "frontend,state,architecture",
+      "content_sha": "c1c8c6086268ae1931b97ab31025a218737c1710c064c0313b940421b8e097c9",
+      "files": [
+        "SKILL.md"
+      ],
+      "has_scripts": false
+    },
+    {
       "name": "tanstack-query",
       "source": "https://github.com/DeckardGer/tanstack-agent-skills",
       "commit": "b2fc14c9",

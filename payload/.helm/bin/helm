@@ -237,8 +237,15 @@ def merge_antigravity_hooks(dst: Path, src: Path):
     dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
 
 
-def ensure_antigravity_env(root: Path):
+def ensure_antigravity_env(root: Path, target_platforms: list[str] | None = None):
     """Ensure Antigravity environment has valid symlinks, resilient hooks, and role specs."""
+    if target_platforms is not None:
+        platforms = target_platforms
+    else:
+        cfg = L.load_json(root / ".helm/config.json", {})
+        platforms = cfg.get("platforms", [])
+    if platforms and "antigravity" not in platforms:
+        return
     ag_dir = root / ".agents"
     if not ag_dir.exists():
         return
@@ -374,7 +381,7 @@ def sync_repo_blueprint_docs(root: Path, pol: dict | None = None):
 
     cfg = L.load_json(root / ".helm/config.json", {})
     platforms = cfg.get("platforms", [])
-    if "antigravity" in platforms or (root / ".agents").exists():
+    if "antigravity" in platforms or (not platforms and (root / ".agents").exists()):
         ensure_antigravity_env(root)
 
     if not was_clean:
@@ -394,11 +401,11 @@ def sync_repo_blueprint_docs(root: Path, pol: dict | None = None):
         except Exception:
             pass
 
-    for rel_dir in (".agents", ".cursor/agents", ".claude/agents", ".codex/agents"):
+    for rel_dir in (".agents", ".cursor/agents", ".claude/agents", ".codex/agents", ".copilot/agents"):
         dst_dir = root / rel_dir
         src_dir = payload_dir / rel_dir
         if dst_dir.exists() and src_dir.exists():
-            src_files = list(src_dir.glob("*.md")) or [x for x in list_blueprint_files(src_dir) if x.suffix == ".md"]
+            src_files = list(src_dir.glob("*.agent.md")) or list(src_dir.glob("*.md")) or [x for x in list_blueprint_files(src_dir) if x.suffix == ".md"]
             for sf in src_files:
                 if sync_agent_role_file(sf, dst_dir / sf.name):
                     changed = True
@@ -452,11 +459,25 @@ def merge_codex_hooks(dst: Path, src: Path):
     dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
 
 
+def merge_copilot_hooks(dst: Path, src: Path):
+    ours = json.loads(read_blueprint_text(src))
+    cur = json.loads(dst.read_text(encoding="utf-8")) if dst.exists() else {"version": 1, "hooks": {}}
+    cur.setdefault("version", 1)
+    hooks = cur.setdefault("hooks", {})
+    for ev in ("PreToolUse", "preToolUse"):
+        pre = hooks.setdefault(ev, [])
+        kept = [e for e in pre if "helm_guard.py" not in e.get("command", "") and "helm_guard.py" not in e.get("bash", "")]
+        hooks[ev] = kept + ours.get("hooks", {}).get(ev, [])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n", encoding="utf-8")
+
+
 def prompt_platform(repo: Path) -> list[str]:
     has_ag = (repo / ".agents").exists()
     has_cl = (repo / ".claude").exists()
     has_cx = (repo / ".codex").exists()
     has_cu = (repo / ".cursor").exists()
+    has_cp = (repo / ".copilot").exists()
 
     default_choice = "4"
     if has_ag:
@@ -467,6 +488,8 @@ def prompt_platform(repo: Path) -> list[str]:
         default_choice = "3"
     elif has_cu:
         default_choice = "4"
+    elif has_cp:
+        default_choice = "5"
 
     w = 68
     border = "─" * w
@@ -484,12 +507,14 @@ def prompt_platform(repo: Path) -> list[str]:
     print(f"│{op3:<68}│")
     op4 = f"  [4] Cursor {'(detected .cursor/)' if has_cu else ''}"
     print(f"│{op4:<68}│")
-    op5 = "  [5] Multi-Platform (All platforms)"
+    op5 = f"  [5] GitHub Copilot CLI {'(detected .copilot/)' if has_cp else ''}"
     print(f"│{op5:<68}│")
+    op6 = "  [6] Multi-Platform (All platforms)"
+    print(f"│{op6:<68}│")
     print(ctext(f"└{border}┘", "cyan"))
 
     try:
-        choice = prompt_user(f"\nSelect platform [1-5, default: {default_choice}]: ").strip() or default_choice
+        choice = prompt_user(f"\nSelect platform [1-6, default: {default_choice}]: ").strip() or default_choice
     except (EOFError, KeyboardInterrupt):
         choice = default_choice
 
@@ -498,7 +523,8 @@ def prompt_platform(repo: Path) -> list[str]:
         "2": ["claude"],
         "3": ["codex"],
         "4": ["cursor"],
-        "5": ["antigravity", "claude", "codex", "cursor"],
+        "5": ["copilot"],
+        "6": ["antigravity", "claude", "codex", "cursor", "copilot"],
     }
     selected = mapping.get(choice, ["antigravity" if has_ag else "cursor"])
     print(ctext(f"  ✔ Configured for: {', '.join(selected)}\n", "green"))
@@ -513,12 +539,14 @@ def get_platform_gitignores(platforms: list[str]) -> list[str]:
         "__pycache__/",
         "*.py[cod]",
     ]
-    if "antigravity" in platforms:
+    if "antigravity" in platforms or "copilot" in platforms:
         ignores.append(".agents/")
     if "claude" in platforms:
         ignores.append(".claude/")
     if "codex" in platforms:
         ignores.append(".codex/")
+    if "copilot" in platforms:
+        ignores.append(".copilot/")
     if "cursor" in platforms:
         ignores.extend([
             ".cursor/agents/",
@@ -548,13 +576,14 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
     has_cl = (root / ".claude").exists()
     has_cx = (root / ".codex").exists()
     has_cu = (root / ".cursor").exists()
-    detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu)] if has]
+    has_cp = (root / ".copilot").exists()
+    detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu), ("copilot", has_cp)] if has]
 
     cfg_p = root / ".helm/config.json"
     platforms = None
     if target_platforms:
         if "all" in target_platforms:
-            platforms = ["antigravity", "claude", "codex", "cursor"]
+            platforms = ["antigravity", "claude", "codex", "cursor", "copilot"]
         else:
             platforms = list(target_platforms)
     elif cfg_p.exists():
@@ -569,6 +598,12 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
             platforms = detected or ["cursor"]
 
     print(ctext(f"\nInitializing HELM into {root.name} for {', '.join(platforms)}...", "bold"))
+    cfg_path = root / ".helm/config.json"
+    cfg = L.load_json(cfg_path, {})
+    cfg["platforms"] = platforms
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
     helm_payload_dir = payload_dir / ".helm" if (payload_dir / ".helm").exists() else payload_dir
     for src in list_blueprint_files(helm_payload_dir):
         rel = src.relative_to(payload_dir).as_posix()
@@ -613,7 +648,7 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
         if src.exists():
             merge_antigravity_hooks(root / ".agents/hooks.json", src)
         (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
-        ensure_antigravity_env(root)
+        ensure_antigravity_env(root, platforms)
         ag_mcp = root / ".agents/mcp_config.json"
         if not ag_mcp.exists():
             seed_mcp = (root / ".cursor/mcp.json") if (root / ".cursor/mcp.json").exists() else None
@@ -649,6 +684,22 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
                 copy_blueprint_file(af, df)
         print(ctext("  ✔ Configured OpenAI Codex hooks and role definitions", "green"))
 
+    if "copilot" in platforms:
+        src = payload_dir / ".copilot/hooks/helm-guard.json"
+        if src.exists():
+            merge_copilot_hooks(root / ".copilot/hooks/helm-guard.json", src)
+        (root / ".agents/skills").mkdir(parents=True, exist_ok=True)
+        (root / ".copilot/agents").mkdir(parents=True, exist_ok=True)
+        src_agents = payload_dir / ".copilot/agents" if (payload_dir / ".copilot/agents").exists() else payload_dir / ".cursor/agents"
+        cp_files = list(src_agents.glob("*.agent.md")) or list(src_agents.glob("*.md")) or [p for p in list_blueprint_files(src_agents) if p.suffix == ".md"]
+        for af in cp_files:
+            dst_name = af.name if af.name.endswith(".agent.md") else (af.stem + ".agent.md")
+            df = root / ".copilot/agents" / dst_name
+            df.parent.mkdir(parents=True, exist_ok=True)
+            if not df.exists():
+                copy_blueprint_file(af, df)
+        print(ctext("  ✔ Configured GitHub Copilot CLI hooks and role definitions", "green"))
+
     bundled_skills_src = payload_dir / ".cursor/skills"
     if bundled_skills_src.exists():
         for sf in list_blueprint_files(bundled_skills_src):
@@ -658,7 +709,7 @@ def perform_repo_install(root: Path, target_platforms: list[str] | None = None) 
             for p_name in platforms:
                 if p_name == "cursor":
                     target_f = root / ".cursor/skills" / rel_in_skills
-                elif p_name == "antigravity":
+                elif p_name in ("antigravity", "copilot"):
                     target_f = root / ".agents/skills" / rel_in_skills
                 elif p_name == "claude":
                     target_f = root / ".claude/skills" / rel_in_skills
@@ -1643,11 +1694,13 @@ def cmd_start(a):
     req_plat = None
     if getattr(a, "platform_ag", False):
         req_plat = "antigravity"
+    elif getattr(a, "platform_cp", False):
+        req_plat = "copilot"
     elif getattr(a, "platform", None):
         req_plat = a.platform
 
     if req_plat:
-        target_platforms = ["antigravity", "claude", "codex", "cursor"] if req_plat == "all" else [req_plat]
+        target_platforms = ["antigravity", "claude", "codex", "cursor", "copilot"] if req_plat == "all" else [req_plat]
     else:
         target_platforms = None
 
@@ -1678,7 +1731,8 @@ def cmd_start(a):
             has_cl = (root / ".claude").exists()
             has_cx = (root / ".codex").exists()
             has_cu = (root / ".cursor").exists()
-            detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu)] if has]
+            has_cp = (root / ".copilot").exists()
+            detected = [p for p, has in [("antigravity", has_ag), ("claude", has_cl), ("codex", has_cx), ("cursor", has_cu), ("copilot", has_cp)] if has]
             platforms = detected or ["cursor"]
             cfg["platforms"] = platforms
             cfg_p.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
@@ -1716,7 +1770,7 @@ def cmd_start(a):
             L.integrity_refresh(root, pol)
             print(ctext("  ✔ Initialized .agents/mcp_config.json (Atlassian MCP configuration template)", "green"))
 
-    if "antigravity" in platforms or (root / ".agents").exists():
+    if "antigravity" in platforms or (not platforms and (root / ".agents").exists()):
         ensure_antigravity_env(root)
 
     if not L.integrity_path(root).exists():
@@ -2055,7 +2109,7 @@ def cmd_start(a):
         return
 
     print("\n" + ctext("👉 Next Step (AI Agent Turn):", "bold"))
-    if "cursor" in platforms and "antigravity" not in platforms and "claude" not in platforms and "codex" not in platforms:
+    if "cursor" in platforms and "antigravity" not in platforms and "claude" not in platforms and "codex" not in platforms and "copilot" not in platforms:
         print(f"   Run " + ctext("helm work", "cyan") + " (or in Cursor: " + ctext(f"/work {a.id}", "cyan") + ")")
     else:
         print(f"   Run " + ctext("helm work", "cyan"))
@@ -2339,7 +2393,7 @@ def get_cli_runner(root: Path | None = None, model_id: str | None = None, effort
         parts = shlex.split(custom)
         if shutil.which(parts[0]):
             if model_id and model_id != "inherit" and "--model" not in parts and "-m" not in parts:
-                if parts[0].endswith(("cursor-agent", "claude", "agy", "antigravity", "gemini", "codex")):
+                if parts[0].endswith(("cursor-agent", "claude", "agy", "antigravity", "gemini", "codex", "copilot")):
                     if "-p" in parts:
                         idx = parts.index("-p")
                         parts = parts[:idx] + ["--model", model_id] + parts[idx:]
@@ -2366,11 +2420,13 @@ def get_cli_runner(root: Path | None = None, model_id: str | None = None, effort
             platforms.append("claude")
         if (root / ".codex").exists():
             platforms.append("codex")
+        if (root / ".copilot").exists():
+            platforms.append("copilot")
         if (root / ".cursor").exists():
             platforms.append("cursor")
 
     if not platforms:
-        platforms = ["antigravity", "claude", "codex", "cursor"]
+        platforms = ["antigravity", "claude", "codex", "cursor", "copilot"]
 
     for plat in platforms:
         if plat in ("antigravity", "gemini"):
@@ -2402,6 +2458,13 @@ def get_cli_runner(root: Path | None = None, model_id: str | None = None, effort
                 if model_id and model_id != "inherit":
                     cmd += ["--model", model_id]
                 cmd += ["--force", "--trust", "-p"]
+                return cmd
+        elif plat == "copilot":
+            if shutil.which("copilot"):
+                cmd = ["copilot"]
+                if model_id and model_id != "inherit":
+                    cmd += ["--model", model_id]
+                cmd += ["--allow-all-tools", "-p"]
                 return cmd
     return None
 
@@ -2686,7 +2749,7 @@ def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: 
         ]
     elif any(k in combined for k in ("not logged in", "unauthorized", "authentication required", "please log in", "session expired", "401")):
         reason = f"AI Agent Authentication Required ({bin_name})"
-        login_cmd = f"{bin_name} auth login" if bin_name in ("agy", "antigravity") else (f"{bin_name} login" if bin_name in ("claude", "cursor-agent") else f"configure credentials for {bin_name}")
+        login_cmd = f"{bin_name} auth login" if bin_name in ("agy", "antigravity", "copilot") else (f"{bin_name} login" if bin_name in ("claude", "cursor-agent") else f"configure credentials for {bin_name}")
         tips = [
             f"• Option 1: Authenticate CLI by running `{login_cmd}`",
             f"• Option 2: Proceed manually in your agent interface with the prompt above",
@@ -2725,6 +2788,8 @@ def format_runner_diagnostics(runner: list[str], returncode: int, output_lines: 
 def get_agent_role_path(root: Path, role_name: str) -> Path:
     cfg = L.load_json(root / ".helm/config.json", {})
     platforms = cfg.get("platforms", [])
+    if "copilot" in platforms and (root / f".copilot/agents/{role_name}.agent.md").exists():
+        return root / f".copilot/agents/{role_name}.agent.md"
     if "antigravity" in platforms and (root / f".agents/{role_name}.md").exists():
         return root / f".agents/{role_name}.md"
     if "claude" in platforms and (root / f".claude/agents/{role_name}.md").exists():
@@ -2733,6 +2798,10 @@ def get_agent_role_path(root: Path, role_name: str) -> Path:
         return root / f".codex/agents/{role_name}.md"
     if (root / f".cursor/agents/{role_name}.md").exists():
         return root / f".cursor/agents/{role_name}.md"
+    if (root / f".copilot/agents/{role_name}.agent.md").exists():
+        return root / f".copilot/agents/{role_name}.agent.md"
+    if "copilot" in platforms:
+        return root / f".copilot/agents/{role_name}.agent.md"
     if "antigravity" in platforms:
         return root / f".agents/{role_name}.md"
     if "claude" in platforms:
@@ -3483,7 +3552,9 @@ def cmd_setup(a):
     cfg = L.load_json(cfg_path, {})
     platforms = cfg.get("platforms", [])
 
-    if "antigravity" in platforms:
+    if "copilot" in platforms:
+        platform_label = "GitHub Copilot"
+    elif "antigravity" in platforms:
         platform_label = "Google Antigravity"
     elif "claude" in platforms:
         platform_label = "Anthropic Claude Code"
@@ -3604,7 +3675,7 @@ def cmd_abort(a):
 
 def _collect_clean_targets(root: Path) -> list[str]:
     targets = []
-    for d in (".helm", ".agents", ".claude", ".codex"):
+    for d in (".helm", ".agents", ".claude", ".codex", ".copilot"):
         p = root / d
         if p.exists() or p.is_symlink():
             targets.append(f"{d}/")
@@ -3628,7 +3699,7 @@ def _collect_clean_targets(root: Path) -> list[str]:
     if gi.exists():
         try:
             gi_txt = gi.read_text(encoding="utf-8")
-            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor"]))
+            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor", "copilot"]))
             if "# HELM local developer governance files" in gi_txt or any(line.strip() in helm_ignores for line in gi_txt.splitlines()):
                 targets.append(".gitignore (HELM ignore entries)")
         except Exception:
@@ -3638,7 +3709,7 @@ def _collect_clean_targets(root: Path) -> list[str]:
 
 def _remove_helm_setup(root: Path) -> list[str]:
     removed = []
-    for d in (".helm", ".agents", ".claude", ".codex"):
+    for d in (".helm", ".agents", ".claude", ".codex", ".copilot"):
         p = root / d
         if p.exists() or p.is_symlink():
             if p.is_symlink() or p.is_file():
@@ -3690,7 +3761,7 @@ def _remove_helm_setup(root: Path) -> list[str]:
     if gi.exists():
         try:
             lines = gi.read_text(encoding="utf-8").splitlines()
-            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor"]))
+            helm_ignores = set(get_platform_gitignores(["antigravity", "claude", "codex", "cursor", "copilot"]))
             marker = "# HELM local developer governance files"
             new_lines = []
             in_helm_block = False
@@ -3959,7 +4030,7 @@ def cmd_bootstrap(a):
 
 
 # ---------------------------------------------------------------- skills
-SKILL_DIRS = [".cursor/skills", ".agents/skills", ".claude/skills", ".codex/skills"]
+SKILL_DIRS = [".cursor/skills", ".agents/skills", ".claude/skills", ".codex/skills", ".copilot/skills"]
 RISKY = re.compile(r"(?i)ignore (all |any )?(previous|prior) instructions|curl |wget |base64|eval\(|exec\(|child_process|subprocess|os\.system|rm -rf|sudo |\.ssh|api[_-]?key|BEGIN (RSA|OPENSSH)|pip install|npm install|<!--|display\s*:\s*none|font-size\s*:\s*0|</?(system|user_message)|[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 TEXT_EXT = {".md", ".txt", ".json", ".yaml", ".yml", ".mdx"}
 
@@ -3985,7 +4056,7 @@ def discovered_skills(root):
 def active_skills_dir(root: Path) -> Path:
     cfg = L.load_json(root / ".helm/config.json", {})
     plats = cfg.get("platforms", [])
-    if "antigravity" in plats:
+    if "copilot" in plats or "antigravity" in plats:
         return root / ".agents/skills"
     if "claude" in plats:
         return root / ".claude/skills"
@@ -4095,6 +4166,8 @@ def doctor_checks(root, pol):
             platforms.append("claude")
         if (root / ".codex").exists():
             platforms.append("codex")
+        if (root / ".copilot").exists():
+            platforms.append("copilot")
         if (root / ".cursor").exists() or not platforms:
             platforms.append("cursor")
 
@@ -4150,6 +4223,23 @@ def doctor_checks(root, pol):
         )
         add("PASS" if wired else "FAIL", ".codex/hooks.json: OpenAI Codex PreToolUse guard wired" if wired else ".codex/hooks.json: missing helm_guard.py hook")
 
+    if "copilot" in platforms:
+        cp_hooks = L.load_json(root / ".copilot/hooks/helm-guard.json", {})
+        hk = (cp_hooks or {}).get("hooks", {})
+        pre_tool = hk.get("PreToolUse", []) + hk.get("preToolUse", [])
+        wired = any("helm_guard.py" in h.get("command", "") or "helm_guard.py" in h.get("bash", "") for h in pre_tool)
+        add("PASS" if wired else "FAIL", ".copilot/hooks/helm-guard.json: GitHub Copilot PreToolUse guard wired" if wired else ".copilot/hooks/helm-guard.json: missing helm_guard.py hook")
+
+        has_bin = shutil.which("copilot") is not None
+        add("PASS" if has_bin else "WARN", "GitHub Copilot CLI binary found on PATH" if has_bin else "No Copilot CLI binary found (install @github/copilot for CLI runner)")
+
+        roles = ["discovery", "planner", "reviewer", "test-analyst"]
+        missing_roles = [r for r in roles if not (root / f".copilot/agents/{r}.agent.md").exists()]
+        if missing_roles:
+            add("WARN", f".copilot/agents/: missing role definitions for {', '.join(missing_roles)} (run `helm init` to sync)")
+        else:
+            add("PASS", ".copilot/agents/: role definitions present")
+
     if "cursor" in platforms:
         hooks = L.load_json(root / ".cursor/hooks.json", {})
         hk = (hooks or {}).get("hooks", {})
@@ -4196,7 +4286,7 @@ def doctor_checks(root, pol):
     else:
         co = [root / "CODEOWNERS", root / ".github/CODEOWNERS", root / "docs/CODEOWNERS"]
         cot = "".join(p.read_text(errors="replace") for p in co if p.exists())
-        covers_framework = any(p in cot for p in (".cursor", ".agents", ".claude", ".codex")) and ".helm" in cot
+        covers_framework = any(p in cot for p in (".cursor", ".agents", ".claude", ".codex", ".copilot")) and ".helm" in cot
         add("PASS" if covers_framework else "WARN", "CODEOWNERS covers framework directories and .helm/" if covers_framework else "CODEOWNERS does not cover framework directories (framework changes unreviewed)")
     add("INFO", "managed hooks at /etc/cursor/hooks.json: " + ("present" if Path("/etc/cursor/hooks.json").exists() else "absent (project hooks are agent-reachable only via protected-path rules; ask IT for managed hooks)"))
     fails = G.selftest(root)
@@ -4207,7 +4297,7 @@ def doctor_checks(root, pol):
 def live_check(root):
     cli = get_cli_runner(root)
     if not cli:
-        return [("FAIL", "No AI CLI runner found on PATH (set HELM_CLI_CMD or install agy, claude, codex, or cursor-agent)")]
+        return [("FAIL", "No AI CLI runner found on PATH (set HELM_CLI_CMD or install agy, claude, codex, copilot, or cursor-agent)")]
     bin_name = os.path.basename(cli[0])
     res = []
     for label, tmpl in (("main-agent", "Run exactly this one shell command and report only its output: echo HELM_CANARY_DENY_{n}"),):
@@ -4471,8 +4561,9 @@ def main():
     s.add_argument("--tier", type=int, choices=[1, 2], default=None, help="Workflow tier (1: Quick, 2: Standard)")
     s.add_argument("--allow-dirty", action="store_true", help="Allow starting with uncommitted changes")
     s.add_argument("--story", default=None, help="Story or requirements description")
-    s.add_argument("--platform", choices=["cursor", "antigravity", "claude", "codex", "all"], default=None, help="Target AI agent platform")
+    s.add_argument("--platform", choices=["cursor", "antigravity", "claude", "codex", "copilot", "all"], default=None, help="Target AI agent platform")
     s.add_argument("--ag", dest="platform_ag", action="store_true", help="Shortcut for --platform antigravity")
+    s.add_argument("--cp", dest="platform_cp", action="store_true", help="Shortcut for --platform copilot")
     s.add_argument("--model", default=None, help="Model override for discovery phase (e.g. claude-opus-5-5, claude-haiku-5-5)")
     s.add_argument("--effort", choices=["low", "medium", "high"], default=None, help="Reasoning effort override (low, medium, high)")
     s.add_argument("--manual", action="store_true", help="Print discovery prompt only without auto-executing CLI runner")

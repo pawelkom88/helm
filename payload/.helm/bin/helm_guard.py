@@ -736,7 +736,32 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
                 return "antigravity", "tool", {"tool_name": name, "tool_input": args, "cwd": cwd}
         return "antigravity", mode, payload
 
-    # 2. Claude Code & Codex format (explicit hint, matcher/turn_id, or Bash tool)
+    # 2. Copilot format (GitHub Copilot CLI or VS Code Copilot)
+    if plat in ("copilot", "github_copilot") or "toolName" in payload or "toolArgs" in payload:
+        tname = payload.get("toolName") or payload.get("tool_name") or payload.get("tool") or ""
+        targs = payload.get("toolArgs") or payload.get("tool_input") or {}
+        if isinstance(targs, str):
+            try:
+                targs = json.loads(targs)
+            except Exception:
+                targs = {"command": targs, "path": targs}
+        cwd = payload.get("cwd")
+
+        tname_norm = _norm(tname)
+        if tname_norm in ("bash", "shell", "runinterminal", "executereninterminal", "terminal"):
+            cmd = targs.get("command") or targs.get("CommandLine") or ""
+            return "copilot", "shell", {"command": cmd, "cwd": cwd}
+        if tname_norm in ("view", "readfile", "read"):
+            p = targs.get("path") or targs.get("filepath") or targs.get("targetfile") or ""
+            return "copilot", "read", {"file_path": p, "cwd": cwd}
+        if tname_norm in ("edit", "create", "write", "editfiles", "editfile", "writefile"):
+            return "copilot", "tool", {"tool_name": "Write", "tool_input": targs, "cwd": cwd}
+        if tname_norm in ("fetch", "webfetch", "readurlcontent"):
+            url = targs.get("url") or _find_url(targs) or ""
+            return "copilot", "tool", {"tool_name": "WebFetch", "tool_input": {"url": url}, "cwd": cwd}
+        return "copilot", "tool", {"tool_name": tname, "tool_input": targs, "cwd": cwd}
+
+    # 3. Claude Code & Codex format (explicit hint, matcher/turn_id, or Bash tool)
     is_claude_codex = (
         plat in ("claude", "codex", "claude_codex")
         or "matcher" in payload
@@ -760,7 +785,7 @@ def normalize_ingress(mode: str, payload: dict, platform_hint: str = "") -> tupl
             return "claude_codex", "tool", {"tool_name": "WebSearch", "tool_input": inp, "cwd": payload.get("cwd")}
         return "claude_codex", mode, payload
 
-    # 3. Native Cursor format (default)
+    # 4. Native Cursor format (default)
     return "cursor", mode, payload
 
 
@@ -775,6 +800,26 @@ def format_egress(platform: str, out: dict) -> tuple[dict, int]:
         if out.get("permissionOverrides"):
             res["permissionOverrides"] = out["permissionOverrides"]
         return res, 0
+
+    if platform in ("copilot", "github_copilot"):
+        if is_deny:
+            sys.stderr.write(f"HELM POLICY_BLOCK: {reason}\n")
+            return {
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+            }, 2
+        return {
+            "permissionDecision": "allow",
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            },
+        }, 0
 
     if platform == "claude_codex":
         if is_deny:
@@ -862,6 +907,11 @@ SELFTEST = [
     ("tool", {"toolCall": {"name": "view_file", "args": {"AbsolutePath": "src/index.ts"}}}, True),
     ("tool", {"tool_name": "Bash", "command": "git push"}, False),
     ("tool", {"tool_name": "Bash", "command": "git status"}, True),
+    ("tool", {"toolName": "bash", "toolArgs": "{\"command\": \"git push\"}"}, False),
+    ("tool", {"toolName": "bash", "toolArgs": "{\"command\": \"git status\"}"}, True),
+    ("tool", {"toolName": "view", "toolArgs": "{\"path\": \".env\"}"}, False),
+    ("tool", {"toolName": "view", "toolArgs": "{\"path\": \"src/index.ts\"}"}, True),
+    ("tool", {"toolName": "edit", "toolArgs": "{\"path\": \".helm/policy/policy.json\"}"}, False),
 ]
 
 

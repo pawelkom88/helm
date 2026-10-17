@@ -792,6 +792,7 @@ class TestSkills(Base):
             "grill-with-docs": {"source": "https://github.com/mattpocock/skills", "commit": "49dd158d", "license": "MIT", "scope": "workflow,design"},
             "playwright-best-practices": {"source": "https://github.com/currents-dev/playwright-best-practices-skill", "commit": "283d5cbc", "license": "Apache-2.0", "scope": "testing,e2e"},
             "react-composition-patterns": {"source": "https://github.com/vercel-labs/agent-skills", "commit": "063bee94", "license": "MIT", "scope": "frontend,react19"},
+            "state-machines": {"source": "bundled:helm-vscode-kit", "commit": "c4d1e2f0", "license": "MIT", "scope": "frontend,state,architecture"},
             "tanstack-query": {"source": "https://github.com/DeckardGer/tanstack-agent-skills", "commit": "b2fc14c9", "license": "MIT", "scope": "frontend,data-fetching"},
             "vercel-react-best-practices": {"source": "https://github.com/vercel-labs/agent-skills", "commit": "063bee94", "license": "MIT", "scope": "frontend,react19,perf"},
         }
@@ -841,7 +842,7 @@ class TestSkills(Base):
         repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(new_repo))
         sh(sys.executable, str(BUNDLE / "install.py"), str(new_repo), "--platform", "all", cwd=new_repo, env=repo_env)
         expected_skills = {"fowler-code-craft", "grill-with-docs", "playwright-best-practices",
-                           "react-composition-patterns", "tanstack-query", "vercel-react-best-practices"}
+                           "react-composition-patterns", "state-machines", "tanstack-query", "vercel-react-best-practices"}
         for pdir in [".agents/skills", ".claude/skills", ".codex/skills", ".cursor/skills"]:
             present = {d.name for d in (new_repo / pdir).iterdir() if d.is_dir()}
             self.assertEqual(present, expected_skills, f"Mismatch in {pdir}")
@@ -859,13 +860,13 @@ class TestSkills(Base):
         tmp_dst.write_text("")
         self.assertTrue(install.merge_skills_lock(tmp_dst, tmp_src))
         data = json.loads(tmp_dst.read_text())
-        self.assertEqual(len(data.get("skills", [])), 6)
+        self.assertEqual(len(data.get("skills", [])), 7)
 
         # 2. Corrupt JSON
         tmp_dst.write_text("{not valid json")
         self.assertTrue(install.merge_skills_lock(tmp_dst, tmp_src))
         data = json.loads(tmp_dst.read_text())
-        self.assertEqual(len(data.get("skills", [])), 6)
+        self.assertEqual(len(data.get("skills", [])), 7)
 
         # 3. Preserves custom skills
         custom_lock = {
@@ -887,7 +888,7 @@ class TestSkills(Base):
         merged = json.loads(tmp_dst.read_text())
         names = {s["name"] for s in merged["skills"]}
         self.assertIn("my-custom-skill", names)
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 8)
 
     def test_skills_verify_detects_tamper_in_secondary_platform(self):
         new_repo = self.tmp / "tamper_repo"
@@ -1841,11 +1842,132 @@ class TestMultiPlatform(Base):
                            cwd=all_repo, env=repo_env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
         cfg = json.loads((all_repo / ".helm/config.json").read_text())
-        self.assertEqual(cfg.get("platforms"), ["antigravity", "claude", "codex", "cursor"])
+        self.assertEqual(cfg.get("platforms"), ["antigravity", "claude", "codex", "cursor", "copilot"])
         self.assertTrue((all_repo / ".agents/hooks.json").exists())
         self.assertTrue((all_repo / ".cursor/hooks.json").exists())
         self.assertTrue((all_repo / ".claude/settings.json").exists())
         self.assertTrue((all_repo / ".codex/hooks.json").exists())
+        self.assertTrue((all_repo / ".copilot/hooks/helm-guard.json").exists())
+
+    def test_copilot_install_and_guard(self):
+        cp_repo = self.tmp / "cp-repo-test"
+        cp_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=cp_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=cp_repo)
+        sh("git", "config", "user.name", "Dev", cwd=cp_repo)
+        (cp_repo / "main.py").write_text("print('copilot')\n")
+        sh("git", "add", ".", cwd=cp_repo)
+        sh("git", "commit", "-qm", "init", cwd=cp_repo)
+
+        sh(sys.executable, str(BUNDLE / "install.py"), str(cp_repo), "--platform", "copilot", cwd=cp_repo, env=self.env)
+        self.assertTrue((cp_repo / ".copilot/hooks/helm-guard.json").exists())
+        self.assertTrue((cp_repo / ".copilot/agents").exists())
+        for role in ("discovery", "planner", "implementer", "reviewer", "specialist-reviewer", "test-analyst", "bootstrapper"):
+            self.assertTrue((cp_repo / f".copilot/agents/{role}.agent.md").exists(), f"missing {role}.agent.md")
+        self.assertTrue((cp_repo / ".agents/skills").exists())
+        self.assertTrue((cp_repo / ".agents/skills/state-machines/SKILL.md").exists())
+        self.assertFalse((cp_repo / ".cursor/hooks.json").exists())
+        self.assertFalse((cp_repo / ".github").exists())
+        cfg = json.loads((cp_repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["copilot"])
+        gi_content = (cp_repo / ".gitignore").read_text()
+        self.assertIn(".copilot/", gi_content)
+        self.assertIn(".agents/", gi_content)
+        self.assertIn(".helm/", gi_content)
+        self.assertIn("AGENTS.md", gi_content)
+
+        # Copilot guard tests
+        # 1. Deny git commit via copilot format
+        payload_git = {"toolName": "bash", "toolArgs": {"command": "git commit -m evil"}}
+        r = subprocess.run([sys.executable, str(cp_repo / ".helm/bin/helm_guard.py"), "tool", "--platform", "copilot"],
+                           input=json.dumps(payload_git), text=True, capture_output=True, cwd=cp_repo, env=self.env)
+        self.assertEqual(r.returncode, 2)
+        res = json.loads(r.stdout)
+        self.assertEqual(res.get("permissionDecision"), "deny")
+        self.assertIn("git commit", res.get("permissionDecisionReason", "").lower())
+
+        # 2. Allow git status
+        payload_status = {"toolName": "bash", "toolArgs": {"command": "git status"}}
+        r2 = subprocess.run([sys.executable, str(cp_repo / ".helm/bin/helm_guard.py"), "tool", "--platform", "copilot"],
+                            input=json.dumps(payload_status), text=True, capture_output=True, cwd=cp_repo, env=self.env)
+        self.assertEqual(r2.returncode, 0)
+        res2 = json.loads(r2.stdout)
+        self.assertEqual(res2.get("permissionDecision"), "allow")
+
+        # 3. Deny secret read
+        payload_sec = {"toolName": "view", "toolArgs": {"path": str(cp_repo / ".env")}}
+        r3 = subprocess.run([sys.executable, str(cp_repo / ".helm/bin/helm_guard.py"), "tool", "--platform", "copilot"],
+                            input=json.dumps(payload_sec), text=True, capture_output=True, cwd=cp_repo, env=self.env)
+        self.assertEqual(r3.returncode, 2)
+        res3 = json.loads(r3.stdout)
+        self.assertEqual(res3.get("permissionDecision"), "deny")
+
+    def test_helm_start_copilot_platform_and_cp_shortcut(self):
+        cp_repo = self.tmp / "cp-repo-start"
+        cp_repo.mkdir()
+        sh("git", "init", "-q", ".", cwd=cp_repo)
+        sh("git", "config", "user.email", "dev@example.com", cwd=cp_repo)
+        sh("git", "config", "user.name", "Dev", cwd=cp_repo)
+        (cp_repo / "main.py").write_text("print('cp')\n")
+        sh("git", "add", ".", cwd=cp_repo)
+        sh("git", "commit", "-qm", "init", cwd=cp_repo)
+
+        repo_env = dict(self.env, CURSOR_PROJECT_DIR=str(cp_repo))
+        r = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--platform", "copilot", "CP-1", "--tier", "1", "--allow-dirty"],
+                           cwd=cp_repo, env=repo_env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        cfg = json.loads((cp_repo / ".helm/config.json").read_text())
+        self.assertEqual(cfg.get("platforms"), ["copilot"])
+        self.assertTrue((cp_repo / ".copilot/hooks/helm-guard.json").exists())
+        self.assertTrue((cp_repo / ".copilot/agents/discovery.agent.md").exists())
+        self.assertTrue((cp_repo / ".helm/work/CP-1").exists())
+        self.assertFalse((cp_repo / ".github").exists())
+
+        # Shortcut --cp test
+        cp_repo2 = self.tmp / "cp-repo-cp"
+        cp_repo2.mkdir()
+        sh("git", "init", "-q", ".", cwd=cp_repo2)
+        sh("git", "config", "user.email", "dev@example.com", cwd=cp_repo2)
+        sh("git", "config", "user.name", "Dev", cwd=cp_repo2)
+        (cp_repo2 / "main.py").write_text("print('cp2')\n")
+        sh("git", "add", ".", cwd=cp_repo2)
+        sh("git", "commit", "-qm", "init", cwd=cp_repo2)
+
+        repo_env2 = dict(self.env, CURSOR_PROJECT_DIR=str(cp_repo2))
+        r2 = subprocess.run([sys.executable, str(BUNDLE / "payload/.helm/bin/helm"), "start", "--cp", "CP-2", "--tier", "1", "--allow-dirty"],
+                            cwd=cp_repo2, env=repo_env2, capture_output=True, text=True)
+        self.assertEqual(r2.returncode, 0, f"stdout: {r2.stdout}\nstderr: {r2.stderr}")
+        cfg2 = json.loads((cp_repo2 / ".helm/config.json").read_text())
+        self.assertEqual(cfg2.get("platforms"), ["copilot"])
+        self.assertTrue((cp_repo2 / ".copilot/hooks/helm-guard.json").exists())
+        self.assertTrue((cp_repo2 / ".helm/work/CP-2").exists())
+        self.assertFalse((cp_repo2 / ".github").exists())
+
+    def test_copilot_runner_and_agent_paths(self):
+        import importlib.machinery
+        import importlib.util
+        helm_path = self.repo / ".helm/bin/helm"
+        loader = importlib.machinery.SourceFileLoader("helm_cli_cp", str(helm_path))
+        spec = importlib.util.spec_from_loader("helm_cli_cp", loader)
+        helm_cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(helm_cli)
+
+        with unittest.mock.patch("shutil.which") as mock_which:
+            mock_which.side_effect = lambda b: f"/usr/local/bin/{b}" if b == "copilot" else None
+            (self.repo / ".helm/config.json").write_text(json.dumps({"platforms": ["copilot"]}))
+            runner = helm_cli.get_cli_runner(self.repo)
+            self.assertEqual(runner, ["copilot", "--allow-all-tools", "-p"])
+
+            runner_model = helm_cli.get_cli_runner(self.repo, model_id="gpt-5-mini")
+            self.assertEqual(runner_model, ["copilot", "--model", "gpt-5-mini", "--allow-all-tools", "-p"])
+
+        # Check role path returns .copilot/agents/{role}.agent.md
+        (self.repo / ".copilot/agents").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".copilot/agents/discovery.agent.md").write_text("# Discovery Agent\n")
+        role_path = helm_cli.get_agent_role_path(self.repo, "discovery")
+        self.assertEqual(role_path, self.repo / ".copilot/agents/discovery.agent.md")
+        active_skills = helm_cli.active_skills_dir(self.repo)
+        self.assertEqual(active_skills, self.repo / ".agents/skills")
 
     def test_ag_switch_seeds_mcp_config_and_work_does_not_reprompt(self):
         # 1. Start with a repo that already has .cursor/mcp.json (like self.repo)

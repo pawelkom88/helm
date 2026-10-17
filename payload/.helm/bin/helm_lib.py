@@ -791,7 +791,7 @@ def validate(wd: Path, name: str, tier: int = 2, root=None):
                 if trec and "baseline" in trec:
                     base_head = trec["baseline"]["head"]
                     mod_files = set(changed_files(root, base_head))
-                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/", "AGENTS.md", f"{WORK_REL}/")
                     repo_src_changes = [f for f in mod_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes)]
                     if not repo_src_changes:
                         probs.append(
@@ -816,7 +816,7 @@ def validate(wd: Path, name: str, tier: int = 2, root=None):
                 if trec and "baseline" in trec:
                     base_head = trec["baseline"]["head"]
                     mod_files = set(changed_files(root, base_head))
-                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+                    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/", "AGENTS.md", f"{WORK_REL}/")
                     repo_src_changes = [f for f in mod_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes)]
                     if not repo_src_changes:
                         probs.append(
@@ -1190,7 +1190,7 @@ def compute_task_metrics(root: Path, task: str, pol: dict | None = None) -> dict
         bytes_by_path[p] = max(bytes_by_path.get(p, 0), b_int)
         tok = estimate_tokens_from_bytes(b_int)
 
-        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
+        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
         if is_framework:
             framework_reads += 1
             framework_tokens += tok
@@ -1233,7 +1233,7 @@ def compute_task_metrics(root: Path, task: str, pol: dict | None = None) -> dict
     unmodified_oos_files = []
     unmodified_oos_tokens = 0
     for p in sorted(reads_by_path.keys()):
-        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
+        is_framework = p.startswith((".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/")) or p == "AGENTS.md" or p.startswith(f"{WORK_REL}/")
         if not is_framework and not is_planned(p, planned_paths):
             if p not in modified_set:
                 t = estimate_tokens_from_bytes(bytes_by_path.get(p, 0))
@@ -1340,7 +1340,7 @@ def correlate_task_learnings(root: Path, task: str, pol: dict | None = None) -> 
 
     # 1. Co-Change / Coupled Files
     coupled_candidates: list[str] = []
-    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/", "AGENTS.md", f"{WORK_REL}/")
     for m in sorted(modified_files):
         if any(m.startswith(pfx) or m == pfx for pfx in framework_prefixes):
             continue
@@ -1522,7 +1522,7 @@ def generate_diff_digest(root: Path, task: str, base_head: str, wd: Path, pol: d
     untracked_out = git_out(root, ["ls-files", "--others", "--exclude-standard"])
     untracked_files = [f for f in untracked_out.splitlines() if f and not f.startswith((".helm/", f"{WORK_REL}/"))]
 
-    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", "AGENTS.md", f"{WORK_REL}/")
+    framework_prefixes = (".helm/", ".cursor/", ".agents/", ".claude/", ".codex/", ".copilot/", "AGENTS.md", f"{WORK_REL}/")
     repo_modified = sorted(f for f in modified_files if not any(f.startswith(pfx) or f == pfx for pfx in framework_prefixes))
 
     planned_and_modified = [f for f in repo_modified if is_planned(f, planned_paths)]

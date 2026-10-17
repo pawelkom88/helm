@@ -107,12 +107,14 @@ def get_platform_gitignores(platforms: list[str]) -> list[str]:
         "__pycache__/",
         "*.py[cod]",
     ]
-    if "antigravity" in platforms:
+    if "antigravity" in platforms or "copilot" in platforms:
         ignores.append(".agents/")
     if "claude" in platforms:
         ignores.append(".claude/")
     if "codex" in platforms:
         ignores.append(".codex/")
+    if "copilot" in platforms:
+        ignores.append(".copilot/")
     if "cursor" in platforms:
         ignores.extend([
             ".cursor/agents/",
@@ -228,11 +230,25 @@ def merge_codex_hooks(dst: Path, src: Path):
     dst.write_text(json.dumps(cur, indent=2) + "\n")
 
 
+def merge_copilot_hooks(dst: Path, src: Path):
+    ours = json.loads(read_payload_text(src))
+    cur = json.loads(dst.read_text()) if dst.exists() else {"version": 1, "hooks": {}}
+    cur.setdefault("version", 1)
+    hooks = cur.setdefault("hooks", {})
+    for ev in ("PreToolUse", "preToolUse"):
+        pre = hooks.setdefault(ev, [])
+        kept = [e for e in pre if "helm_guard.py" not in e.get("command", "") and "helm_guard.py" not in e.get("bash", "")]
+        hooks[ev] = kept + ours.get("hooks", {}).get(ev, [])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(cur, indent=2) + "\n")
+
+
 def prompt_platform(repo: Path) -> list[str]:
     has_ag = (repo / ".agents").exists()
     has_cl = (repo / ".claude").exists()
     has_cx = (repo / ".codex").exists()
     has_cu = (repo / ".cursor").exists()
+    has_cp = (repo / ".copilot").exists()
 
     default_choice = "4"
     if has_ag:
@@ -243,6 +259,8 @@ def prompt_platform(repo: Path) -> list[str]:
         default_choice = "3"
     elif has_cu:
         default_choice = "4"
+    elif has_cp:
+        default_choice = "5"
 
     print("\n" + "=" * 68)
     print("  🔍 AI Platform Configuration")
@@ -252,10 +270,11 @@ def prompt_platform(repo: Path) -> list[str]:
     print(f"  [2] Anthropic Claude Code {'(detected .claude/)' if has_cl else ''}")
     print(f"  [3] OpenAI Codex CLI {'(detected .codex/)' if has_cx else ''}")
     print(f"  [4] Cursor {'(detected .cursor/)' if has_cu else ''}")
-    print("  [5] Multi-Platform (All platforms)")
+    print(f"  [5] GitHub Copilot CLI {'(detected .copilot/)' if has_cp else ''}")
+    print("  [6] Multi-Platform (All platforms)")
 
     try:
-        choice = input(f"\nSelect platform [1-5, default: {default_choice}]: ").strip() or default_choice
+        choice = input(f"\nSelect platform [1-6, default: {default_choice}]: ").strip() or default_choice
     except (EOFError, KeyboardInterrupt):
         choice = default_choice
 
@@ -264,7 +283,8 @@ def prompt_platform(repo: Path) -> list[str]:
         "2": ["claude"],
         "3": ["codex"],
         "4": ["cursor"],
-        "5": ["antigravity", "claude", "codex", "cursor"],
+        "5": ["copilot"],
+        "6": ["antigravity", "claude", "codex", "cursor", "copilot"],
     }
     selected = mapping.get(choice, ["cursor"])
     print(f"  ✔ Configured for: {', '.join(selected)}\n")
@@ -346,13 +366,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("repo", nargs="?")
     ap.add_argument("--global", dest="global_install", action="store_true", help="Install HELM globally so 'helm' works everywhere")
-    ap.add_argument("--platform", choices=["antigravity", "claude", "codex", "cursor", "all"], help="Target AI agent platform")
+    ap.add_argument("--platform", choices=["antigravity", "claude", "codex", "cursor", "copilot", "all"], help="Target AI agent platform")
     ap.add_argument("--ag", dest="platform_ag", action="store_true", help="Shortcut for --platform antigravity")
+    ap.add_argument("--cp", dest="platform_cp", action="store_true", help="Shortcut for --platform copilot")
     ap.add_argument("--reset-policy", action="store_true")
     ap.add_argument("--print-system-hooks", action="store_true")
     a = ap.parse_args()
     if a.platform_ag:
         a.platform = "antigravity"
+    if a.platform_cp:
+        a.platform = "copilot"
     if a.print_system_hooks:
         return print_system_hooks()
     if a.global_install:
@@ -373,7 +396,7 @@ def main():
 
     # Determine platform(s)
     if a.platform:
-        platforms = ["antigravity", "claude", "codex", "cursor"] if a.platform == "all" else [a.platform]
+        platforms = ["antigravity", "claude", "codex", "cursor", "copilot"] if a.platform == "all" else [a.platform]
     elif sys.stdin.isatty():
         platforms = prompt_platform(repo)
     else:
@@ -384,6 +407,8 @@ def main():
             platforms.append("claude")
         if (repo / ".codex").exists():
             platforms.append("codex")
+        if (repo / ".copilot").exists():
+            platforms.append("copilot")
         if (repo / ".cursor").exists() or not platforms:
             platforms.append("cursor")
 
@@ -409,9 +434,11 @@ def main():
             continue
         if rel.startswith(".codex/") and "codex" not in platforms:
             continue
+        if rel.startswith(".copilot/") and "copilot" not in platforms:
+            continue
         if rel.startswith(".cursor/") and "cursor" not in platforms:
             continue
-        if rel.startswith((".cursor/skills/", ".agents/skills/", ".claude/skills/", ".codex/skills/", ".helm/repo/")):
+        if rel.startswith((".cursor/skills/", ".agents/skills/", ".claude/skills/", ".codex/skills/", ".copilot/skills/", ".helm/repo/")):
             continue
 
         dst = repo / rel
@@ -437,6 +464,9 @@ def main():
         elif rel == ".codex/hooks.json":
             merge_codex_hooks(dst, src)
             say("configured .codex/hooks.json (OpenAI Codex fail-closed hooks)")
+        elif rel == ".copilot/hooks/helm-guard.json":
+            merge_copilot_hooks(dst, src)
+            say("configured .copilot/hooks/helm-guard.json (GitHub Copilot CLI fail-closed hooks)")
         elif rel == ".cursor/hooks.json":
             merge_hooks(dst, src)
             say("merged .cursor/hooks.json (your own hooks preserved)")
@@ -480,6 +510,11 @@ def main():
         cx_skills = repo / ".codex/skills"
         cx_skills.mkdir(parents=True, exist_ok=True)
         platform_skills_dirs.append(cx_skills)
+    if "copilot" in platforms:
+        cp_skills = repo / ".agents/skills"
+        cp_skills.mkdir(parents=True, exist_ok=True)
+        if cp_skills not in platform_skills_dirs:
+            platform_skills_dirs.append(cp_skills)
     if "cursor" in platforms:
         cu_skills = repo / ".cursor/skills"
         cu_skills.mkdir(parents=True, exist_ok=True)

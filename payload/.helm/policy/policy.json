@@ -5,6 +5,7 @@
     ".agents/**",
     ".claude/**",
     ".codex/**",
+    ".copilot/**",
     ".helm/bin/**",
     ".helm/policy/**",
     ".helm/templates/**",
@@ -57,7 +58,8 @@
     "**/.agents/**mcp*.json",
     "~/.agents/**",
     "**/.codex/**config*.json",
-    "~/.codex/**"
+    "~/.codex/**",
+    "~/.copilot/**"
   ],
   "secret_allow_globs": [
     "**/.env.example",
